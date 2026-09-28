@@ -1,6 +1,6 @@
 """Sentinel-2 methane candidate screening app.
 
-MBMC-faithful v2 (robust thresholding)
+MBMC-faithful v3 (final)
   • Aradkouh landfill (Tehran) as default AOI
   • Cloud cover 30% + last-30-days date defaults
   • Robust reference selection with fallback
@@ -9,7 +9,7 @@ MBMC-faithful v2 (robust thresholding)
 
 UI/design preserved from the original version.
 Algorithm engine re-implemented following the MBMC paper,
-with robust median/MAD thresholding tuned for landfill/urban AOIs.
+with robust median/MAD thresholding and higher smoothing.
 """
 from __future__ import annotations
 
@@ -63,14 +63,14 @@ DEFAULT_AOI = box(51.20, 35.40, 51.45, 35.60)
 # ── Landfill site (spatial constraint center) ────────────────────────
 SITE_LAT = 35.505
 SITE_LON = 51.330
-SITE_RADIUS_M = 5000.0     # tighter than before (was 10 km)
+SITE_RADIUS_M = 5000.0
 
 # ── MBMC paper constants ─────────────────────────────────────────────
 K_MBMP = 1.0e-5
-DETREND_SIGMA = 150.0      # larger than paper's 100 (more aggressive)
-ABS_FLOOR_PPB = 20.0       # realistic methane-anomaly floor (was 5)
-N_SIGMA = 2.5              # robust multiplier (paper: 1.0, but that assumes clean scenes)
-GAUSS_SIGMA = 1.5          # pre-threshold smoothing (paper: 0.5, but noisy AOI needs more)
+DETREND_SIGMA = 150.0
+ABS_FLOOR_PPB = 20.0
+N_SIGMA = 2.5
+GAUSS_SIGMA = 3.0          # ← تغییر ۱: از 1.5 به 3.0
 FLOOD_MIN_SIZE = 10
 DILATE_RADIUS_FINAL = 3
 
@@ -78,8 +78,8 @@ PARAMS = {
     "b03_quantile": 0.05,
     "swir_saturation": 1.0,
     "ndwi_threshold": 0.20,
-    "ndvi_threshold": 0.45,   # relaxed further for landfill surroundings
-    "ndbi_threshold": 0.40,   # relaxed so landfill surface survives LRAD
+    "ndvi_threshold": 0.45,
+    "ndbi_threshold": 0.40,
     "ndsi_threshold": 0.42,
     "lrad_dilation": 1,
     "gaussian_sigma": GAUSS_SIGMA,
@@ -480,13 +480,11 @@ def make_spatial_mask(shape, profile, lat=SITE_LAT, lon=SITE_LON, radius_m=SITE_
 
 
 def _robust_stats(values):
-    """Median + MAD-based sigma (robust to outliers)."""
     finite = values[np.isfinite(values)]
     if finite.size == 0:
         return 0.0, 1.0
     median = float(np.median(finite))
     mad = float(np.median(np.abs(finite - median)))
-    # 1.4826 * MAD ≈ σ for a normal distribution
     sigma_robust = 1.4826 * mad if mad > 1e-9 else float(np.std(finite))
     if not np.isfinite(sigma_robust) or sigma_robust <= 0:
         sigma_robust = 1.0
@@ -494,33 +492,23 @@ def _robust_stats(values):
 
 
 def run_algorithm(target, reference, profile):
-    """MBMC-faithful plume detection with robust (median/MAD) thresholding."""
-    # 1. LRAD on target only
     target_q = float(np.nanquantile(target["B03"], PARAMS["b03_quantile"]))
     valid = calculate_lrad(target, target_q)
     if valid.sum() < 100:
         raise RuntimeError("LRAD removed nearly all pixels. Relax thresholds or enlarge AOI.")
 
-    # 2. c from target
     c = calculate_c(target["B11"], target["B12"], valid)
-
-    # 3. ΔR on both scenes with shared c
     dR_t = calculate_delta_R(target["B11"], target["B12"], c, valid)
     dR_r = calculate_delta_R(reference["B11"], reference["B12"], c, valid)
 
-    # 4. ΔΩ in ppb
     dOmega_t = dR_t / K_MBMP
     dOmega_r = dR_r / K_MBMP
     dOmega = dOmega_t - dOmega_r
     dOmega[~valid] = np.nan
 
-    # 5. Detrend
     dOmega_detrended, _ = remove_large_scale_background(dOmega, valid, sigma=DETREND_SIGMA)
-
-    # 6. Gaussian smoothing
     d_smooth = normalized_gaussian(dOmega_detrended, valid, GAUSS_SIGMA)
 
-    # 7. ROBUST threshold: median + N_SIGMA * MAD-based σ
     vals = d_smooth[np.isfinite(d_smooth)]
     if vals.size == 0:
         raise RuntimeError("No finite values after detrending. Try a different reference scene.")
@@ -533,11 +521,9 @@ def run_algorithm(target, reference, profile):
 
     candidate = np.isfinite(d_smooth) & (d_smooth > threshold) & valid
 
-    # 8. Spatial constraint
     spatial_mask, site_rc = make_spatial_mask(dOmega.shape, profile)
     candidate &= spatial_mask
 
-    # 9. Keep only the largest connected component (paper convention)
     structure = np.ones((3, 3), dtype=np.uint8)
     labeled, n_labels = label(candidate, structure=structure)
     plume = np.zeros_like(candidate, dtype=bool)
@@ -550,18 +536,15 @@ def run_algorithm(target, reference, profile):
             order = order[order != 0]
             best_label = int(order[0])
             best_size = int(sizes_kept[best_label])
-            # If the top component is tiny, merge top-3 to avoid losing the plume
             if best_size < 30 and len(order) >= 2:
                 top_labels = order[:3]
                 plume = np.isin(labeled, top_labels)
             else:
                 plume = (labeled == best_label)
-            # Sanity: reject implausibly large blobs
             area_km2 = plume.sum() * (RESOLUTION * RESOLUTION) / 1e6
             if area_km2 > PARAMS["max_plume_area_km2"]:
                 plume[:] = False
 
-    # 10. Final dilation & clipping
     if plume.any() and PARAMS["final_dilation"] > 0:
         plume = binary_dilation(plume, structure=disk(int(PARAMS["final_dilation"])))
     plume &= valid & spatial_mask
@@ -574,8 +557,8 @@ def run_algorithm(target, reference, profile):
         "spatial_mask": spatial_mask,
         "initial": candidate,
         "final": plume,
-        "mean": median,          # display: median (robust center)
-        "std": sigma_robust,     # display: robust sigma
+        "mean": median,
+        "std": sigma_robust,
         "threshold": threshold,
         "regions": int(1 if plume.any() else 0),
         "valid_count": int(valid.sum()),
@@ -728,11 +711,12 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
         if best_ref_bands is None:
             return None
         result = run_algorithm(target_bands, best_ref_bands, target_profile)
+        # ← تغییر ۲: mean/max/std از detrended محاسبه می‌شن
         row = {
             "date": target_date,
-            "mean_mbmp": float(np.nanmean(result["relative"])),
-            "max_mbmp": float(np.nanmax(result["relative"])),
-            "std_mbmp": float(np.nanstd(result["relative"])),
+            "mean_mbmp": float(np.nanmean(result["detrended"])),
+            "max_mbmp": float(np.nanmax(result["detrended"])),
+            "std_mbmp": float(np.nanstd(result["detrended"])),
             "final_pixels": int(result["final_count"]),
             "regions": int(result["regions"]),
             "b4_correlation": float(best_corr) if np.isfinite(best_corr) else np.nan,
@@ -1181,11 +1165,13 @@ if "result" in st.session_state:
     metrics[3].metric("Final", f"{result['final_count']:,}")
     metrics[4].metric("Regions", result["regions"])
     metrics[5].metric("Threshold", f"{result['threshold']:.2f}")
+
+    # ← تغییر ۳: پنل‌های بالا حالا detrended اول، و valid آخر
     result_items = [
-        ("relative", "Relative ΔΩ (raw)", "Anomaly"),
-        ("detrended", "ΔΩ after detrend", "Detrended"),
+        ("detrended", "ΔΩ after detrend (ppb)", "Detrended"),
         ("gaussian", "Gaussian smoothed", "Smoothed"),
         ("final", "Methane candidates", "Final mask"),
+        ("valid", "Valid pixels", "Validity mask"),
     ]
     result_cols = st.columns(4, gap="small")
     for col, (key, title, tag) in zip(result_cols, result_items):
@@ -1198,7 +1184,13 @@ if "result" in st.session_state:
                 st.image(png_outputs[key], use_container_width=True, output_format="PNG")
             with legend_col:
                 st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
-                st.markdown(legend_html("mask" if key == "final" else "continuous"), unsafe_allow_html=True)
+                if key == "final":
+                    legend_kind = "mask"
+                elif key == "valid":
+                    legend_kind = "valid"
+                else:
+                    legend_kind = "continuous"
+                st.markdown(legend_html(legend_kind), unsafe_allow_html=True)
             path = st.session_state.paths[key]
             format_choice = st.selectbox("Download format", ["GeoTIFF (georeferenced)", "PNG + World File (georeferenced)"], key=f"format_choice_{key}")
             if format_choice == "GeoTIFF (georeferenced)":
@@ -1207,17 +1199,6 @@ if "result" in st.session_state:
                 png_package = georeferenced_png_package(result[key], profile, mask=key in ("final", "valid"))
                 st.download_button("⬇ Download Georeferenced PNG package", png_package, file_name=f"{key}_georeferenced_png.zip", mime="application/zip", key=f"download_png_compact_{key}", use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
-    vc1, vc2 = st.columns([1, 3], gap="small")
-    with vc1:
-        st.markdown('<div class="result-tag">Validity mask</div>', unsafe_allow_html=True)
-        st.image(png_outputs["valid"], use_container_width=True, output_format="PNG")
-    with vc2:
-        st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
-        st.markdown(legend_html("valid"), unsafe_allow_html=True)
-        vpath = st.session_state.paths["valid"]
-        st.download_button("⬇ Download validity mask (GeoTIFF)", vpath.read_bytes(), file_name=vpath.name, mime="image/tiff", key="download_valid_mask", use_container_width=False)
 
     removed_pixels = max(0, int(result["initial_count"]) - int(result["final_count"]))
     st.markdown(f'<div class="result-note"><b>Robust thresholding:</b> median = <b>{result["mean"]:.2f} ppb</b>, robust σ = <b>{result["std"]:.2f} ppb</b>, threshold = <b>{result["threshold"]:.2f} ppb</b>. Only the largest connected region ≥ <b>{int(PARAMS["min_component_pixels"]):,} px</b> was kept (MBMC convention). Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · c = <b>{result["c"]:.4f}</b> · detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
@@ -1229,7 +1210,7 @@ if "result" in st.session_state:
 
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05a · 30-DAY TIME SERIES & VISUAL PLAYBACK</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">Track daily changes of relative ΔΩ (ppb) over the 30-day window. Use the slider below the chart to visually scrub through each day.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">Track daily changes of detrended ΔΩ (ppb) over the 30-day window. Use the slider below the chart to visually scrub through each day.</div>', unsafe_allow_html=True)
 
     ts_col1, ts_col2 = st.columns([1, 3], gap="small")
     with ts_col1:
@@ -1300,7 +1281,7 @@ if "result" in st.session_state:
         if not ts.empty and "mean_mbmp" in ts.columns:
             chart_df = ts.dropna(subset=["mean_mbmp"]).set_index("date")[["mean_mbmp", "max_mbmp"]]
             if not chart_df.empty:
-                st.markdown('<div class="card-caption">Daily ΔΩ (ppb) statistics in the AOI</div>', unsafe_allow_html=True)
+                st.markdown('<div class="card-caption">Daily detrended ΔΩ (ppb) statistics in the AOI</div>', unsafe_allow_html=True)
                 st.line_chart(chart_df, use_container_width=True, height=240)
                 st.dataframe(
                     ts,
