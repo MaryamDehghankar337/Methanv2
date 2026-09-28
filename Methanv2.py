@@ -46,7 +46,7 @@ TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 RESOLUTION = 20
 DATA_BANDS = ["B03", "B04", "B08", "B11", "B12"]
-OUTPUT_BANDS = DATA_BANDS + ["SCL", "CLD", "DATA_MASK"]
+OUTPUT_BANDS = DATA_BANDS + ["SCL", "CLM", "DATA_MASK"]
 CACHE_DIR = Path.home() / ".sentinel_methane_cache_v2"
 RESULT_DIR = Path.home() / ".sentinel_methane_results_v2"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -231,12 +231,34 @@ def evalscript():
 function setup() {
   return {
     input: [{
-      bands: ["B03", "B04", "B08", "B11", "B12", "SCL", "CLD", "dataMask"],
-      units: "REFLECTANCE"
+      bands: [
+        "B03",
+        "B04",
+        "B08",
+        "B11",
+        "B12",
+        "SCL",
+        "CLM",
+        "dataMask"
+      ],
+      units: [
+        "REFLECTANCE",
+        "REFLECTANCE",
+        "REFLECTANCE",
+        "REFLECTANCE",
+        "REFLECTANCE",
+        "DN",
+        "DN",
+        "DN"
+      ]
     }],
-    output: {bands: 8, sampleType: "FLOAT32"}
+    output: {
+      bands: 8,
+      sampleType: "FLOAT32"
+    }
   };
 }
+
 function evaluatePixel(sample) {
   return [
     sample.B03,
@@ -245,7 +267,7 @@ function evaluatePixel(sample) {
     sample.B11,
     sample.B12,
     sample.SCL,
-    sample.CLD,
+    sample.CLM,
     sample.dataMask
   ];
 }
@@ -290,9 +312,11 @@ def download_scene(item, aoi, access_token, cloud_probability=35.0):
             "data": [{
                 "type": "sentinel-2-l2a",
                 "dataFilter": {
-                    "timeRange": {"from": start, "to": end},
+                    "timeRange": {
+                        "from": start,
+                        "to": end
+                    },
                     "mosaickingOrder": "leastCC",
-                    "maxCloudCoverage": float(cloud_probability),
                 },
             }],
         },
@@ -350,17 +374,43 @@ def normalized_difference(first, second):
 
 def quality_mask(bands, cloud_probability=35.0):
     scl = np.rint(bands["SCL"]).astype(np.int16)
-    cld = bands["CLD"]
+    clm = np.rint(bands["CLM"]).astype(np.int16)
     data_mask = bands["DATA_MASK"] >= 0.5
 
-    bad_scl = np.isin(scl, [0, 1, 3, 7, 8, 9, 10, 11])
-    bad_cloud_probability = np.isfinite(cld) & (cld > float(cloud_probability))
-    finite = np.logical_and.reduce([
-        np.isfinite(bands[name]) for name in DATA_BANDS
-    ])
-    positive = (bands["B11"] > 0) & (bands["B12"] > 0)
+    bad_scl = np.isin(
+        scl,
+        [
+            0,   # no data
+            1,   # saturated or defective
+            3,   # cloud shadow
+            7,   # unclassified / potentially contaminated
+            8,   # cloud medium probability
+            9,   # cloud high probability
+            10,  # thin cirrus
+            11,  # snow or ice
+        ],
+    )
 
-    valid = data_mask & finite & positive & ~bad_scl & ~bad_cloud_probability
+    bad_cloud = clm == 1
+
+    finite = np.logical_and.reduce([
+        np.isfinite(bands[name])
+        for name in DATA_BANDS
+    ])
+
+    positive = (
+        (bands["B11"] > 0)
+        & (bands["B12"] > 0)
+    )
+
+    valid = (
+        data_mask
+        & finite
+        & positive
+        & ~bad_scl
+        & ~bad_cloud
+    )
+
     return valid
 
 
