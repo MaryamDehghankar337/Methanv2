@@ -1,15 +1,11 @@
-"""Sentinel-2 methane screening — signal-preserving version.
+"""Sentinel-2 methane screening — clean version.
 
-CRITICAL FIX: Previous version killed real signal via overly-aggressive
-filters (binary_opening disk(2), min_pixels=40, solidity=0.55).
-This version:
-  • Removes binary_opening entirely
-  • Reduces spatial_coherence_min from 7 → 4
-  • Reduces min_component_pixels from 40 → 10
-  • Reduces min_solidity from 0.55 → 0.15
-  • Adds UI sliders for all critical filter params
-  • Shows INITIAL and COHERENT masks as separate views
-  • Multi-reference median + SWIR correlation
+FIXES:
+  • Removed ternary with st calls (caused DeltaGenerator crash)
+  • Removed nested columns inside columns (Streamlit cursor bug)
+  • Removed nested-quote f-strings
+  • Removed binary_opening (was killing signal)
+  • All filter params exposed in UI
 """
 from __future__ import annotations
 
@@ -30,12 +26,7 @@ import requests
 import rasterio
 import streamlit as st
 from folium.plugins import Draw
-from scipy.ndimage import (
-    binary_dilation,
-    gaussian_filter,
-    label,
-    convolve,
-)
+from scipy.ndimage import binary_dilation, gaussian_filter, label, convolve
 from shapely.geometry import box, mapping, shape
 from shapely.ops import unary_union
 from skimage.morphology import disk
@@ -66,11 +57,10 @@ PARAMS = {
     "n_reference_scenes": 6,
     "gaussian_sigma": 1.5,
     "threshold_sigma": 2.0,
-    # ── MUCH LESS AGGRESSIVE ─────────────────────────────────────────
-    "spatial_coherence_min": 4,     # 4 of 8 neighbors (was 7)
-    "min_component_pixels": 10,      # was 40
+    "spatial_coherence_min": 4,
+    "min_component_pixels": 10,
     "final_dilation": 2,
-    "min_solidity": 0.15,            # was 0.55
+    "min_solidity": 0.15,
     "b12_epsilon": 1e-6,
     "min_valid_ref_pixels": 100,
 }
@@ -172,7 +162,12 @@ def authenticate_cdse(username: str, password: str, totp: str = ""):
     totp = totp.strip()
     if not username or not password:
         raise RuntimeError("Please enter your Copernicus email and password.")
-    form = {"grant_type": "password", "client_id": "cdse-public", "username": username, "password": password}
+    form = {
+        "grant_type": "password",
+        "client_id": "cdse-public",
+        "username": username,
+        "password": password,
+    }
     if totp:
         form["totp"] = totp
     response = requests.post(TOKEN_URL, data=form, timeout=90)
@@ -201,7 +196,11 @@ def refresh_cdse_session(auth):
         return None
     response = requests.post(
         TOKEN_URL,
-        data={"grant_type": "refresh_token", "client_id": "cdse-public", "refresh_token": refresh_token},
+        data={
+            "grant_type": "refresh_token",
+            "client_id": "cdse-public",
+            "refresh_token": refresh_token,
+        },
         timeout=90,
     )
     if response.status_code >= 400:
@@ -297,7 +296,7 @@ def download_scene(item, aoi, access_token):
 
 def download_s5p_scene(aoi, date_from, date_to, access_token):
     aoi = ensure_aoi(aoi)
-    cache_id = hashlib.sha256(json.dumps(["s5p_v5", aoi, str(date_from), str(date_to)], sort_keys=True).encode()).hexdigest()[:24]
+    cache_id = hashlib.sha256(json.dumps(["s5p_v6", aoi, str(date_from), str(date_to)], sort_keys=True).encode()).hexdigest()[:24]
     folder = CACHE_DIR / f"s5p_{cache_id}"
     output_path = folder / "ch4.tif"
     if output_path.exists():
@@ -341,14 +340,14 @@ def normalized_difference(first, second):
 def calculate_lrad(bands, q_value):
     finite = np.logical_and.reduce([np.isfinite(bands[band]) for band in BANDS])
     artifact = ((bands["B11"] >= PARAMS["swir_saturation"]) & (bands["B12"] >= PARAMS["swir_saturation"]))
-    artifact |= bands["B03"] <= q_value
-    artifact |= normalized_difference(bands["B03"], bands["B08"]) >= PARAMS["ndwi_threshold"]
-    artifact |= normalized_difference(bands["B08"], bands["B04"]) >= PARAMS["ndvi_threshold"]
-    artifact |= normalized_difference(bands["B11"], bands["B08"]) >= PARAMS["ndbi_threshold"]
-    artifact |= normalized_difference(bands["B03"], bands["B11"]) >= PARAMS["ndsi_threshold"]
-    artifact |= ~finite
+    artifact = artifact | (bands["B03"] <= q_value)
+    artifact = artifact | (normalized_difference(bands["B03"], bands["B08"]) >= PARAMS["ndwi_threshold"])
+    artifact = artifact | (normalized_difference(bands["B08"], bands["B04"]) >= PARAMS["ndvi_threshold"])
+    artifact = artifact | (normalized_difference(bands["B11"], bands["B08"]) >= PARAMS["ndbi_threshold"])
+    artifact = artifact | (normalized_difference(bands["B03"], bands["B11"]) >= PARAMS["ndsi_threshold"])
+    artifact = artifact | (~finite)
     artifact = binary_dilation(artifact, structure=disk(PARAMS["lrad_dilation"]))
-    return finite & ~artifact
+    return finite & (~artifact)
 
 
 def calculate_c(b11, b12, valid):
@@ -370,7 +369,6 @@ def run_algorithm_multi(target, reference_median, valid_lrad):
     c_target = calculate_c(target["B11"], target["B12"], valid_lrad)
     target_mbsp = calculate_mbsp(target["B11"], target["B12"], c_target, valid_lrad)
     reference_mbsp = calculate_mbsp(reference_median["B11"], reference_median["B12"], c_target, valid_lrad)
-
     relative = target_mbsp - reference_mbsp
     relative[~valid_lrad] = np.nan
     finite = np.isfinite(relative)
@@ -380,23 +378,20 @@ def run_algorithm_multi(target, reference_median, valid_lrad):
     values = relative[finite].astype(np.float64)
     mean_value = float(np.mean(values))
     std_value = float(np.std(values))
-
     gaussian = gaussian_filter(np.where(finite, relative, mean_value), sigma=PARAMS["gaussian_sigma"])
     threshold = mean_value + PARAMS["threshold_sigma"] * std_value
 
-    # Stage 1: pixel above threshold
     above = valid_lrad & np.isfinite(gaussian) & (gaussian > threshold)
 
-    # Stage 2: spatial coherence (require N of 8 neighbors also above)
     neighbor_count = convolve(
         above.astype(np.float32),
         np.ones((3, 3), dtype=np.float32),
         mode="constant",
-    ) - above.astype(np.float32)
+    )
+    neighbor_count = neighbor_count - above.astype(np.float32)
 
     coherent = above & (neighbor_count >= PARAMS["spatial_coherence_min"])
 
-    # Stage 3: connected components with size + solidity filter
     labels, _ = label(coherent, structure=np.ones((3, 3), dtype=np.uint8))
     sizes = np.bincount(labels.ravel())
     retained = np.where(sizes >= PARAMS["min_component_pixels"])[0]
@@ -417,9 +412,6 @@ def run_algorithm_multi(target, reference_median, valid_lrad):
         retained = np.array(sorted(keep)) if keep else np.array([], dtype=int)
 
     connected = np.isin(labels, retained)
-
-    # NOTE: NO binary_opening here — it kills small real plumes.
-    # Final dilation only.
     final = binary_dilation(connected, structure=disk(PARAMS["final_dilation"])) & valid_lrad
 
     return {
@@ -461,11 +453,11 @@ def image_png(array, mask=False):
     from PIL import Image
     data = np.asarray(array)
     if mask:
-        rgb = np.zeros((*data.shape, 3), dtype=np.uint8)
+        rgb = np.zeros((data.shape[0], data.shape[1], 3), dtype=np.uint8)
         rgb[data.astype(bool)] = [220, 30, 30]
     else:
         finite = np.isfinite(data)
-        rgb = np.full((*data.shape, 3), 255, dtype=np.uint8)
+        rgb = np.full((data.shape[0], data.shape[1], 3), 255, dtype=np.uint8)
         if finite.any():
             values = data[finite]
             low, high = float(np.percentile(values, 2)), float(np.percentile(values, 98))
@@ -486,7 +478,7 @@ def ch4_anomaly_png(array):
     import matplotlib.pyplot as plt
     data = np.asarray(array).astype(np.float32)
     finite = np.isfinite(data)
-    rgb = np.full((*data.shape, 3), 255, dtype=np.uint8)
+    rgb = np.full((data.shape[0], data.shape[1], 3), 255, dtype=np.uint8)
     if finite.any() and finite.sum() > 1:
         values = data[finite]
         mean_val = float(np.mean(values))
@@ -512,8 +504,11 @@ def legend_html(kind):
         rows = [("#b43232", "Above local mean"), ("#3250b4", "Below local mean"), ("#ffffff", "No data")]
     else:
         rows = [("#b43232", "Higher anomaly"), ("#3250b4", "Lower anomaly"), ("#ffffff", "No data")]
-    items = "".join(f'<div class="legend-row"><span class="legend-swatch" style="background:{c};"></span><span>{t}</span></div>' for c, t in rows)
-    return f'<div class="result-legend"><div class="legend-heading">Legend</div>{items}</div>'
+    items = "".join(
+        '<div class="legend-row"><span class="legend-swatch" style="background:' + c + ';"></span><span>' + t + '</span></div>'
+        for c, t in rows
+    )
+    return '<div class="result-legend"><div class="legend-heading">Legend</div>' + items + '</div>'
 
 
 def create_png_worldfile(profile, array_shape):
@@ -522,7 +517,7 @@ def create_png_worldfile(profile, array_shape):
     yres = transform.e
     x_center = transform.c + xres / 2.0
     y_center = transform.f + yres / 2.0
-    pgw = f"{xres:.12f}\n0.0\n0.0\n{yres:.12f}\n{x_center:.12f}\n{y_center:.12f}\n"
+    pgw = str(xres) + "\n0.0\n0.0\n" + str(yres) + "\n" + str(x_center) + "\n" + str(y_center) + "\n"
     crs_text = profile.get("crs")
     prj = crs_text.to_wkt() if crs_text else ""
     return pgw.encode("utf-8"), prj.encode("utf-8")
@@ -549,35 +544,23 @@ st.set_page_config(page_title="Sentinel-2 Methane", page_icon="🛰️", layout=
 
 st.markdown("""
 <style>
-:root { --honeydew:#f1faee; --frost:#a8dadc; --blue:#457b9d; --navy:#1d3557;
-        --black:#111111; --border:#d8e6e8; --dark-field:#292a33; }
-.stApp { background: #f1faee; color: #111111 !important; }
-[data-testid="stHeader"] { background: #f1faee !important; height: 3.25rem !important; }
+.stApp { background: #f1faee; }
+[data-testid="stHeader"] { background: #f1faee !important; }
 [data-testid="stSidebar"] { display: none; }
-.block-container { max-width: 1700px; padding-top: 3.9rem !important; padding-bottom: 0.8rem; padding-left: 1.2rem; padding-right: 1.2rem; }
-.app-header { display: flex; align-items: center; justify-content: space-between; background: #ffffff; border: 1px solid var(--border); border-radius: 16px; padding: 0.75rem 1rem; margin-bottom: 0.9rem; }
-.app-title { color: #111111 !important; font-size: 1.45rem; font-weight: 850; }
-.app-subtitle { color: #111111 !important; font-size: 0.78rem; }
-.status-pill { background: #f1faee; color: #111111 !important; border: 1px solid #a8dadc; border-radius: 999px; padding: 0.35rem 0.7rem; font-size: 0.72rem; font-weight: 750; white-space: nowrap; }
-.app-card { background: #ffffff; border: 1px solid var(--border); border-radius: 15px; padding: 0.75rem; color: #111111 !important; }
-.card-title { color: #111111 !important; font-size: 1rem; font-weight: 800; }
-.card-caption { color: #111111 !important; font-size: 0.73rem; margin-bottom: 0.45rem; }
-.section-label { display: inline-block; background: #a8dadc; color: #111111 !important; border-radius: 999px; padding: 0.2rem 0.55rem; font-size: 0.65rem; font-weight: 800; margin-bottom: 0.35rem; }
-.stApp p, .stApp label, .stApp small, .stApp strong, .stApp li, .stApp td, .stApp th { color: #111111 !important; }
+.block-container { max-width: 1700px; padding-top: 3.5rem; }
+h1, h2, h3, h4, p, label, small, strong, em, li, td, th, div[data-testid="stMarkdownContainer"] * { color: #111111 !important; }
 div[data-testid="stDateInput"] input, .stDateInput input,
 div[data-testid="stNumberInput"] input, .stNumberInput input {
-    background-color: var(--dark-field) !important; color: #ffffff !important;
+    background-color: #292a33 !important; color: #ffffff !important;
     -webkit-text-fill-color: #ffffff !important;
 }
-input::placeholder, textarea::placeholder { color: #bfc3cc !important; }
+input::placeholder { color: #bfc3cc !important; }
 div[data-baseweb="popover"] [role="listbox"], div[data-baseweb="popover"] [role="option"] { background: #111318 !important; }
 div[data-baseweb="popover"] [role="listbox"] *, div[data-baseweb="popover"] [role="option"] * { color: #ffffff !important; }
-.stButton > button, .stDownloadButton > button { border-radius: 9px; min-height: 2.15rem; font-weight: 750; font-size: 0.78rem; color: #111111 !important; }
+.stButton > button, .stDownloadButton > button { border-radius: 9px; min-height: 2.15rem; font-weight: 750; font-size: 0.85rem; color: #111111 !important; }
 .stButton > button[kind="primary"] { background: #e63946; border-color: #e63946; color: #ffffff !important; }
 .stButton > button[kind="primary"] * { color: #ffffff !important; }
 .stDownloadButton > button { background: #ffffff; color: #111111 !important; border: 1px solid #a8dadc; }
-.auth-card { background: #f8fbfb; border: 1px solid #d7e4e7; border-radius: 11px; padding: 0.65rem 0.75rem; }
-.auth-status { background: #e8f7ea; border: 1px solid #9ed2a4; color: #155724 !important; border-radius: 9px; padding: 0.45rem 0.6rem; font-size: 0.76rem; font-weight: 700; margin-bottom: 0.45rem; }
 .result-legend { background: #ffffff; border: 1px solid #d7e4e7; border-radius: 10px; padding: 0.75rem 0.7rem; min-height: 96px; display: flex; flex-direction: column; justify-content: center; gap: 0.42rem; }
 .result-legend .legend-heading { color: #111111 !important; font-size: 0.88rem; font-weight: 800; }
 .result-legend .legend-row { display: flex; align-items: center; gap: 0.45rem; color: #111111 !important; font-size: 0.82rem; }
@@ -586,97 +569,118 @@ footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("""
-<div class="app-header">
-    <div>
-        <div class="app-title">🛰️ Sentinel-2 Methane Screening</div>
-        <div class="app-subtitle">Multi-reference median + tunable spatial filter</div>
-    </div>
-    <div class="status-pill">20 m processing</div>
-</div>
-""", unsafe_allow_html=True)
+st.title("🛰️ Sentinel-2 Methane Screening")
+st.caption("Multi-reference median + tunable spatial filter · Aradkouh landfill default AOI")
 
 if "aoi" not in st.session_state:
     st.session_state.aoi = mapping(DEFAULT_AOI)
 
-map_col, control_col = st.columns([1.65, 1.0], gap="small")
+# ══════════════════════════════════════════════════════════════════════
+#  ROW 1: AOI map + Scene search
+# ══════════════════════════════════════════════════════════════════════
+map_col, ctrl_col = st.columns([1.65, 1.0], gap="small")
+
 with map_col:
-    st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">01 · STUDY AREA</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-title">Area of Interest</div>', unsafe_allow_html=True)
+    st.subheader("01 · Study Area")
+    st.caption("Draw or edit the AOI directly on the map.")
     map_data = st_folium(create_map(st.session_state.aoi), height=385, width=1000, key="aoi_map")
     if map_data and map_data.get("all_drawings"):
         new_aoi = normalize_geometry({"type": "FeatureCollection", "features": map_data["all_drawings"]})
         if new_aoi:
             st.session_state.aoi = new_aoi
-    st.markdown('</div>', unsafe_allow_html=True)
 
-with control_col:
-    st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">02 · SEARCH</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-title">Scene Search</div>', unsafe_allow_html=True)
+with ctrl_col:
+    st.subheader("02 · Scene Search")
     default_end = datetime.now().date()
     default_start = default_end - timedelta(days=30)
+
     d1, d2 = st.columns(2, gap="small")
     with d1:
         start_date = st.date_input("Start date", default_start, key="start_date")
     with d2:
         end_date = st.date_input("End date", default_end, key="end_date")
+
     s1, s2 = st.columns(2, gap="small")
     with s1:
         max_cloud = st.slider("Cloud cover (%)", 0.0, 100.0, 30.0, key="max_cloud")
     with s2:
         reference_days = st.slider("Reference window (days)", 1, 90, 60, key="reference_days")
 
-    if st.button("🔎  Search Sentinel-2 scenes", type="primary", use_container_width=True):
+    search_clicked = st.button("🔎  Search Sentinel-2 scenes", type="primary", use_container_width=True, key="search_btn")
+
+    if search_clicked:
         try:
-            with st.spinner("Searching…"):
-                sr = search_scenes(st.session_state.aoi,
-                                   datetime.combine(start_date, datetime.min.time()),
-                                   datetime.combine(end_date, datetime.max.time()),
-                                   max_cloud)
+            with st.spinner("Searching CDSE STAC..."):
+                sr = search_scenes(
+                    st.session_state.aoi,
+                    datetime.combine(start_date, datetime.min.time()),
+                    datetime.combine(end_date, datetime.max.time()),
+                    max_cloud,
+                )
             if sr is None:
                 sr = []
             elif not isinstance(sr, list):
                 sr = list(sr)
             st.session_state["scene_results"] = sr
             st.session_state.pop("target", None)
-            st.success(f"{len(sr)} scene(s)") if sr else st.warning("No scenes found.")
+            if len(sr) > 0:
+                st.success(str(len(sr)) + " scene(s) found")
+            else:
+                st.warning("No Sentinel-2 scenes were found.")
         except Exception as e:
             st.session_state["scene_results"] = []
-            st.error(f"Search failed: {e}")
+            st.session_state.pop("target", None)
+            st.error("Search failed: " + str(e))
 
     scene_results = st.session_state.get("scene_results", [])
 
-    if scene_results:
-        scene_table = pd.DataFrame([{"date": get_datetime(s), "tile": get_tile(s), "cloud": get_cloud(s)} for s in scene_results]).sort_values(["date", "cloud"], ascending=[True, True], na_position="last")
-        st.dataframe(scene_table, use_container_width=True, height=112, hide_index=True,
-                     column_config={"date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
-                                    "cloud": st.column_config.NumberColumn("Cloud %", format="%.1f")})
-        scene_ids = [as_dict(s).get("id") for s in scene_results if as_dict(s).get("id")]
+    if len(scene_results) > 0:
+        scene_table = pd.DataFrame([
+            {"date": get_datetime(s), "tile": get_tile(s), "cloud": get_cloud(s)}
+            for s in scene_results
+        ]).sort_values(["date", "cloud"], ascending=[True, True], na_position="last")
 
-        def fmt(sid):
-            s = next((c for c in scene_results if as_dict(c).get("id") == sid), None)
-            if s is None:
-                return str(sid)
-            sd = get_datetime(s)
-            dt = sd.strftime("%Y-%m-%d") if sd else "?"
-            return f"{dt} | {get_tile(s) or '?'} | cloud {get_cloud(s):.1f}%"
+        st.dataframe(
+            scene_table,
+            use_container_width=True,
+            height=112,
+            hide_index=True,
+            column_config={
+                "date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
+                "cloud": st.column_config.NumberColumn("Cloud %", format="%.1f"),
+            },
+        )
 
-        if scene_ids:
-            sel = st.selectbox("Target scene", scene_ids, format_func=fmt, key="target_scene_select")
-            chosen = next((s for s in scene_results if as_dict(s).get("id") == sel), None)
-            if chosen is not None:
-                st.session_state["target"] = chosen
-    st.markdown('</div>', unsafe_allow_html=True)
+        scene_ids = []
+        for s in scene_results:
+            sid = as_dict(s).get("id")
+            if sid:
+                scene_ids.append(sid)
 
-st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
-settings_col, action_col = st.columns([1.65, 1.0], gap="small")
+        if len(scene_ids) > 0:
+            def format_scene(scene_id):
+                for c in scene_results:
+                    if as_dict(c).get("id") == scene_id:
+                        sd = get_datetime(c)
+                        dt = sd.strftime("%Y-%m-%d") if sd else "?"
+                        return dt + "  |  " + (get_tile(c) or "?") + "  |  cloud " + format(get_cloud(c), ".1f") + "%"
+                return str(scene_id)
 
-with settings_col:
-    st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">03 · DETECTION PARAMETERS</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption" style="font-weight:700;">Signal detection</div>', unsafe_allow_html=True)
+            selected_id = st.selectbox("Target scene", scene_ids, format_func=format_scene, key="target_scene_select")
+            for s in scene_results:
+                if as_dict(s).get("id") == selected_id:
+                    st.session_state["target"] = s
+                    break
+
+# ══════════════════════════════════════════════════════════════════════
+#  ROW 2: Parameters + Process
+# ══════════════════════════════════════════════════════════════════════
+st.markdown("---")
+param_col, proc_col = st.columns([1.65, 1.0], gap="small")
+
+with param_col:
+    st.subheader("03 · Detection Parameters")
+    st.caption("Signal detection")
     a1, a2, a3 = st.columns(3, gap="small")
     with a1:
         PARAMS["threshold_sigma"] = st.number_input("Threshold (σ)", min_value=0.5, max_value=6.0,
@@ -687,7 +691,8 @@ with settings_col:
     with a3:
         PARAMS["n_reference_scenes"] = st.number_input("Reference count", min_value=2, max_value=20,
                                                         value=int(PARAMS["n_reference_scenes"]), step=1, key="n_refs")
-    st.markdown('<div class="card-caption" style="font-weight:700;margin-top:0.4rem;">Noise filtering (lower = keep more)</div>', unsafe_allow_html=True)
+
+    st.caption("Noise filtering (lower = keep more signal)")
     b1, b2, b3 = st.columns(3, gap="small")
     with b1:
         PARAMS["spatial_coherence_min"] = st.number_input("Coherence (of 8)", min_value=0, max_value=8,
@@ -698,22 +703,23 @@ with settings_col:
     with b3:
         PARAMS["min_solidity"] = st.number_input("Min solidity", min_value=0.0, max_value=1.0,
                                                   value=float(PARAMS["min_solidity"]), step=0.05, key="min_sol")
-    st.markdown(f'<div class="card-caption">Pipeline: threshold (σ) → coherence filter (≥{PARAMS["spatial_coherence_min"]}/8) → size filter (≥{PARAMS["min_component_pixels"]}px) → solidity (≥{PARAMS["min_solidity"]:.2f}).</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
 
-with action_col:
-    st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">04 · PROCESS</div>', unsafe_allow_html=True)
-    scene_results = st.session_state.get("scene_results", [])
+    st.caption(
+        "Pipeline: threshold → coherence (≥" + str(PARAMS["spatial_coherence_min"]) + "/8) → "
+        "size (≥" + str(PARAMS["min_component_pixels"]) + "px) → solidity (≥" + format(PARAMS["min_solidity"], ".2f") + ")."
+    )
+
+with proc_col:
+    st.subheader("04 · Process")
+
     cdse_auth = st.session_state.get("cdse_auth")
     if cdse_auth:
-        st.markdown(f'<div class="auth-status">✓ Connected · {cdse_auth.get("username", "")}</div>', unsafe_allow_html=True)
+        st.success("✓ Copernicus connected · " + cdse_auth.get("username", ""))
         if st.button("Log out", use_container_width=True, key="cdse_logout"):
             st.session_state.pop("cdse_auth", None)
             st.rerun()
     else:
-        st.markdown('<div class="auth-card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">Copernicus login</div>', unsafe_allow_html=True)
+        st.info("Copernicus login")
         st.link_button("🌐 Open Copernicus", "https://dataspace.copernicus.eu/", use_container_width=True)
         with st.form("cdse_login_form", clear_on_submit=True):
             u = st.text_input("Email", placeholder="your-email@example.com")
@@ -727,22 +733,28 @@ with action_col:
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
-        st.markdown('</div>', unsafe_allow_html=True)
 
-    if scene_results and "target" in st.session_state:
+    scene_results = st.session_state.get("scene_results", [])
+    has_target = "target" in st.session_state
+
+    if len(scene_results) > 0 and has_target:
         target = st.session_state.get("target")
         if target is not None:
             tdate = get_datetime(target)
             ttile = get_tile(target) or "?"
             tlabel = tdate.strftime("%Y-%m-%d") if tdate else "?"
-            st.markdown(f'<div class="card-title">Ready</div><div class="card-caption">Target: {tlabel} · {ttile}</div>', unsafe_allow_html=True)
-            clicked = st.button("🛰️  Download & Detect", type="primary", use_container_width=True, key="detect_button",
-                                 disabled=not bool(st.session_state.get("cdse_auth")))
+            st.caption("Target: " + tlabel + " · " + ttile)
+
+            can_detect = bool(st.session_state.get("cdse_auth"))
+            clicked = st.button("🛰️  Download & Detect", type="primary",
+                                 use_container_width=True, key="detect_button",
+                                 disabled=not can_detect)
+
             if clicked:
                 progress = st.progress(0, text="Preparing…")
                 status = st.empty()
                 try:
-                    status.markdown('<div class="card-caption">Step 1/5 · Auth…</div>', unsafe_allow_html=True)
+                    status.caption("Step 1/5 · Auth…")
                     progress.progress(5)
                     access_token = get_access_token()
                     target = st.session_state["target"]
@@ -750,38 +762,52 @@ with action_col:
                     ttile = get_tile(target)
                     if tdate is None:
                         raise RuntimeError("No valid date.")
-                    candidates = [s for s in scene_results
-                                  if as_dict(s).get("id") != as_dict(target).get("id")
-                                  and get_datetime(s) is not None
-                                  and abs((get_datetime(s) - tdate).total_seconds()) / 86400 <= reference_days]
+
+                    candidates = []
+                    for s in scene_results:
+                        if as_dict(s).get("id") == as_dict(target).get("id"):
+                            continue
+                        sd = get_datetime(s)
+                        if sd is None:
+                            continue
+                        if abs((sd - tdate).total_seconds()) / 86400 <= reference_days:
+                            candidates.append(s)
+
                     same_tile = [s for s in candidates if get_tile(s) == ttile]
-                    references = same_tile if same_tile else candidates
-                    if not references:
-                        st.warning("No references.")
+                    references = same_tile if len(same_tile) > 0 else candidates
+                    if len(references) == 0:
+                        st.warning("No references found.")
                         st.stop()
 
-                    status.markdown('<div class="card-caption">Step 2/5 · Target…</div>', unsafe_allow_html=True)
+                    status.caption("Step 2/5 · Downloading target…")
                     progress.progress(15)
                     target_bands, profile = read_stack(download_scene(target, st.session_state.aoi, access_token))
                     tq = float(np.nanquantile(target_bands["B03"], PARAMS["b03_quantile"]))
                     target_lrad = calculate_lrad(target_bands, tq)
 
-                    status.markdown(f'<div class="card-caption">Step 3/5 · {len(references)} references…</div>', unsafe_allow_html=True)
+                    status.caption("Step 3/5 · " + str(len(references)) + " references…")
                     ref_rows = []
                     ref_bands_list = []
                     tot = max(1, len(references))
                     for i, ref in enumerate(references, start=1):
-                        progress.progress(20 + int(45 * i / tot), text=f"Ref {i}/{tot}…")
+                        pct = 20 + int(45 * i / tot)
+                        progress.progress(pct, text="Ref " + str(i) + "/" + str(tot))
                         try:
                             rb, _ = read_stack(download_scene(ref, st.session_state.aoi, access_token))
                         except Exception:
                             continue
-                        vpx = target_lrad & np.isfinite(rb["B11"]) & np.isfinite(rb["B12"]) & np.isfinite(target_bands["B11"]) & np.isfinite(target_bands["B12"])
+                        vpx = (
+                            target_lrad
+                            & np.isfinite(rb["B11"]) & np.isfinite(rb["B12"])
+                            & np.isfinite(target_bands["B11"]) & np.isfinite(target_bands["B12"])
+                        )
                         vc = int(vpx.sum())
                         corr = np.nan
                         if vc >= PARAMS["min_valid_ref_pixels"]:
-                            t11 = target_bands["B11"][vpx]; r11 = rb["B11"][vpx]
-                            t12 = target_bands["B12"][vpx]; r12 = rb["B12"][vpx]
+                            t11 = target_bands["B11"][vpx]
+                            r11 = rb["B11"][vpx]
+                            t12 = target_bands["B12"][vpx]
+                            r12 = rb["B12"][vpx]
                             if np.std(r11) > 1e-9 and np.std(r12) > 1e-9:
                                 try:
                                     c11 = float(np.corrcoef(t11, r11)[0, 1])
@@ -789,20 +815,25 @@ with action_col:
                                     corr = (c11 + c12) / 2.0
                                 except Exception:
                                     pass
-                        ref_rows.append({"id": as_dict(ref).get("id"), "date": get_datetime(ref), "tile": get_tile(ref),
-                                         "swir_correlation": corr, "valid_pixels": vc})
+                        ref_rows.append({
+                            "id": as_dict(ref).get("id"),
+                            "date": get_datetime(ref),
+                            "tile": get_tile(ref),
+                            "swir_correlation": corr,
+                            "valid_pixels": vc,
+                        })
                         if np.isfinite(corr):
                             ref_bands_list.append((corr, rb))
 
                     st.session_state.reference_table = pd.DataFrame(ref_rows)
 
-                    if not ref_bands_list:
+                    if len(ref_bands_list) == 0:
                         st.error("No usable references (SWIR correlation failed).")
                         st.stop()
 
                     ref_bands_list.sort(key=lambda x: -x[0])
                     top_k = ref_bands_list[:PARAMS["n_reference_scenes"]]
-                    status.markdown(f'<div class="card-caption">Step 4/5 · Median of top-{len(top_k)}…</div>', unsafe_allow_html=True)
+                    status.caption("Step 4/5 · Median of top-" + str(len(top_k)) + "…")
                     progress.progress(75)
 
                     b11s = np.stack([rb["B11"] for _, rb in top_k], axis=0)
@@ -824,22 +855,23 @@ with action_col:
                     valid_lrad = target_lrad & ref_lrad
 
                     if valid_lrad.sum() < 1000:
-                        st.warning(f"Only {int(valid_lrad.sum()):,} valid pixels.")
+                        st.warning("Only " + str(int(valid_lrad.sum())) + " valid pixels.")
                         st.stop()
 
-                    status.markdown('<div class="card-caption">Step 5/5 · Detection…</div>', unsafe_allow_html=True)
+                    status.caption("Step 5/5 · Running detection…")
                     progress.progress(90)
 
                     result = run_algorithm_multi(target_bands, median_ref, valid_lrad)
                     result["date"] = tdate.strftime("%Y-%m-%d")
-                    result["b4_correlation"] = float(top_k[0][0]) if top_k else np.nan
+                    result["b4_correlation"] = float(top_k[0][0]) if len(top_k) > 0 else np.nan
 
                     out_folder = RESULT_DIR / tdate.strftime("%Y%m%d")
                     out_folder.mkdir(parents=True, exist_ok=True)
                     paths = {}
                     for key in ("relative", "gaussian", "initial", "coherent", "final", "valid"):
-                        paths[key] = out_folder / f"{key}.tif"
+                        paths[key] = out_folder / (key + ".tif")
                         save_raster(paths[key], result[key], profile, key in ("initial", "coherent", "final", "valid"))
+
                     st.session_state.result = result
                     st.session_state.paths = paths
                     st.session_state.output_profile = profile
@@ -852,93 +884,101 @@ with action_col:
                         "valid": image_png(result["valid"], mask=True),
                     }
                     progress.progress(100, text="Done")
-                    st.success(f"Complete · median of {len(top_k)} references")
+                    st.success("Complete · median of " + str(len(top_k)) + " references")
 
-                    # Informational only
-                    ratio = result["final_count"] / max(1, result["valid_count"])
                     if result["final_count"] == 0:
                         st.info(
-                            f"ℹ️ Final mask is empty. Pipeline counts: initial={result['initial_count']}, "
-                            f"coherent={result['coherent_count']}, final={result['final_count']}. "
-                            f"Lower the **Coherence** or **Min pixels/region** sliders and re-run."
-                        )
-                    elif ratio < 0.0005:
-                        st.info(
-                            f"ℹ️ Small but nonzero signal: {result['final_count']:,} pixels "
-                            f"({ratio*100:.4f}% of valid). Verify visually if the pattern is spatially coherent."
+                            "Final mask is empty. Counts: initial=" + str(result["initial_count"])
+                            + ", coherent=" + str(result["coherent_count"])
+                            + ", final=0. Lower Coherence or Min pixels/region and re-run."
                         )
                 except Exception as e:
-                    st.error(f"Detection failed: {e}")
+                    st.error("Detection failed: " + str(e))
     else:
-        st.markdown('<div class="card-title">Select a scene first</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.caption("Select a scene first.")
 
 # ══════════════════════════════════════════════════════════════════════
 #  RESULTS
 # ══════════════════════════════════════════════════════════════════════
-
 if "result" in st.session_state:
     result = st.session_state.result
     png_outputs = st.session_state.get("png_outputs", {})
     profile = st.session_state.get("output_profile")
-    st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.subheader("05 · Results")
+
     metrics = st.columns(6, gap="small")
-    ct = f"{result['b4_correlation']:.3f}" if np.isfinite(result.get("b4_correlation", np.nan)) else "n/a"
+    ct = format(result["b4_correlation"], ".3f") if np.isfinite(result.get("b4_correlation", np.nan)) else "n/a"
     metrics[0].metric("SWIR corr", ct)
-    metrics[1].metric("Valid", f"{result['valid_count']:,}")
-    metrics[2].metric("Initial", f"{result['initial_count']:,}")
-    metrics[3].metric("Coherent", f"{result.get('coherent_count', 0):,}")
-    metrics[4].metric("Final", f"{result['final_count']:,}")
+    metrics[1].metric("Valid", format(result["valid_count"], ","))
+    metrics[2].metric("Initial", format(result["initial_count"], ","))
+    metrics[3].metric("Coherent", format(result.get("coherent_count", 0), ","))
+    metrics[4].metric("Final", format(result["final_count"], ","))
     metrics[5].metric("Regions", result["regions"])
 
-    # Show 5 panels: initial / coherent / connected / final / valid
+    # 3-panel top row (no nested columns)
     result_items = [
         ("relative", "Relative MBMP", "Anomaly"),
         ("gaussian", "Smoothed", "Gaussian"),
         ("initial", "Above threshold", "Stage 1"),
+    ]
+    row1 = st.columns(3, gap="small")
+    for col, (key, title, tag) in zip(row1, result_items):
+        col.caption(tag + " · " + title)
+        col.image(png_outputs[key], use_container_width=True, output_format="PNG")
+
+    result_items2 = [
         ("coherent", "Coherent only", "Stage 2"),
         ("final", "Final mask", "Stage 3"),
         ("valid", "Valid pixels", "Validity"),
     ]
-    result_cols = st.columns(3, gap="small")
-    for idx, (key, title, tag) in enumerate(result_items):
-        col = result_cols[idx % 3]
-        with col:
-            st.markdown(f'<div class="card-caption" style="font-weight:700;">{tag} · {title}</div>', unsafe_allow_html=True)
-            preview_col, legend_col = st.columns([3.6, 1.0], gap="small")
-            with preview_col:
-                st.image(png_outputs[key], use_container_width=True, output_format="PNG")
-            with legend_col:
-                if key in ("initial", "coherent", "final"):
-                    st.markdown(legend_html("mask"), unsafe_allow_html=True)
-                elif key == "valid":
-                    st.markdown(legend_html("valid"), unsafe_allow_html=True)
-                else:
-                    st.markdown(legend_html("continuous"), unsafe_allow_html=True)
+    row2 = st.columns(3, gap="small")
+    for col, (key, title, tag) in zip(row2, result_items2):
+        col.caption(tag + " · " + title)
+        col.image(png_outputs[key], use_container_width=True, output_format="PNG")
 
-    st.markdown(f'<div class="card-caption">Funnel: <b>{result["initial_count"]:,}</b> above threshold → <b>{result.get("coherent_count", 0):,}</b> coherent → <b>{result["final_count"]:,}</b> final · {result["regions"]:,} regions.</div>', unsafe_allow_html=True)
+    st.caption(
+        "Funnel: " + format(result["initial_count"], ",")
+        + " above threshold → " + format(result.get("coherent_count", 0), ",")
+        + " coherent → " + format(result["final_count"], ",")
+        + " final · " + str(result["regions"]) + " regions."
+    )
 
     dl1, dl2 = st.columns([1, 1], gap="small")
     with dl1:
-        st.download_button("⬇ Reference table CSV", st.session_state.reference_table.to_csv(index=False),
-                            file_name="references.csv", mime="text/csv", key="dl_ref_csv", use_container_width=True)
+        st.download_button(
+            "⬇ Reference table CSV",
+            st.session_state.reference_table.to_csv(index=False),
+            file_name="references.csv",
+            mime="text/csv",
+            key="dl_ref_csv",
+            use_container_width=True,
+        )
     with dl2:
-        st.download_button("⬇ 30-day-ready GeoTIFF pack", st.session_state.paths["final"].read_bytes(),
-                            file_name="final_mask.tif", mime="image/tiff", key="dl_final_tif", use_container_width=True)
+        st.download_button(
+            "⬇ Final mask GeoTIFF",
+            st.session_state.paths["final"].read_bytes(),
+            file_name="final_mask.tif",
+            mime="image/tiff",
+            key="dl_final_tif",
+            use_container_width=True,
+        )
 
-    # ──────────────────────────────────────────────────────────────────
-    # 05b · SENTINEL-5P CH4 CONTEXT
-    # ──────────────────────────────────────────────────────────────────
-    st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). Colormap = anomaly relative to local mean.</div>', unsafe_allow_html=True)
+    # ── Sentinel-5P ──────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("05b · Sentinel-5P CH4 Context")
+    st.caption("TROPOMI CH4 (~5.5 × 7 km). Colormap = anomaly relative to local mean.")
 
     s5p_c1, s5p_c2 = st.columns([1, 3], gap="small")
     with s5p_c1:
-        run_s5p = st.button("🛰️  Fetch S5P CH4", type="primary", use_container_width=True, key="s5p_btn",
-                             disabled=not bool(st.session_state.get("cdse_auth")))
+        run_s5p = st.button(
+            "🛰️  Fetch S5P CH4",
+            type="primary",
+            use_container_width=True,
+            key="s5p_btn",
+            disabled=not bool(st.session_state.get("cdse_auth")),
+        )
     with s5p_c2:
         s5p_days = st.slider("S5P window (days)", 1, 30, 15, key="s5p_days")
 
@@ -949,10 +989,12 @@ if "result" in st.session_state:
             if tdate is None:
                 raise RuntimeError("No target date.")
             with st.spinner("Fetching S5P…"):
-                s5p_path = download_s5p_scene(st.session_state.aoi,
-                                               tdate - timedelta(days=int(s5p_days)),
-                                               tdate + timedelta(days=int(s5p_days)),
-                                               access_token)
+                s5p_path = download_s5p_scene(
+                    st.session_state.aoi,
+                    tdate - timedelta(days=int(s5p_days)),
+                    tdate + timedelta(days=int(s5p_days)),
+                    access_token,
+                )
             with rasterio.open(s5p_path) as src:
                 ch4 = src.read(1).astype(np.float32)
             ch4[~np.isfinite(ch4)] = np.nan
@@ -960,7 +1002,7 @@ if "result" in st.session_state:
             st.session_state.s5p_ch4 = ch4
             st.success("S5P loaded")
         except Exception as e:
-            st.error(f"S5P failed: {e}")
+            st.error("S5P failed: " + str(e))
 
     if "s5p_ch4" in st.session_state:
         ch4 = st.session_state.s5p_ch4
@@ -972,14 +1014,8 @@ if "result" in st.session_state:
             st.warning("No valid S5P pixels. Placeholder shown.")
         if v.size > 1:
             c1, c2, c3, c4 = st.columns(4, gap="small")
-            c1.metric("Mean (ppb)", f"{float(np.nanmean(v)):.1f}")
-            c2.metric("Min", f"{float(np.nanmin(v)):.1f}")
-            c3.metric("Max", f"{float(np.nanmax(v)):.1f}")
-            c4.metric("Range", f"{float(np.nanmax(v) - np.nanmin(v)):.1f}")
-            ic, lc = st.columns([3.6, 1.0], gap="small")
-            with ic:
-                st.image(ch4_anomaly_png(ch4), use_container_width=True, output_format="PNG")
-            with lc:
-                st.markdown(legend_html("s5p"), unsafe_allow_html=True)
-
-    st.markdown('</div>', unsafe_allow_html=True)
+            c1.metric("Mean (ppb)", format(float(np.nanmean(v)), ".1f"))
+            c2.metric("Min", format(float(np.nanmin(v)), ".1f"))
+            c3.metric("Max", format(float(np.nanmax(v)), ".1f"))
+            c4.metric("Range", format(float(np.nanmax(v) - np.nanmin(v)), ".1f"))
+            st.image(ch4_anomaly_png(ch4), use_container_width=True, output_format="PNG")
