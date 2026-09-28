@@ -4,6 +4,7 @@ Integrated version:
   • Aradkouh landfill (Tehran) as default AOI
   • Cloud cover 30% + last-30-days date defaults
   • Balanced noise / signal tuning
+  • Robust reference selection with fallback
   • 30-day time-series + visual daily playback
   • Sentinel-5P CH4 context with anomaly-based visualization
 
@@ -53,8 +54,8 @@ RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 S5P_COLLECTION = "sentinel-5p-l2"
 
-# ── Default AOI: Aradkouh landfill (Tehran) ──────────────────────────
-DEFAULT_AOI = box(51.29, 35.47, 51.35, 35.51)
+# ── Default AOI: Aradkouh landfill (Tehran) — wider for more valid pixels
+DEFAULT_AOI = box(51.20, 35.40, 51.45, 35.60)
 
 PARAMS = {
     "b03_quantile": 0.05,
@@ -64,13 +65,13 @@ PARAMS = {
     "ndbi_threshold": 0.20,
     "ndsi_threshold": 0.42,
     "lrad_dilation": 2,
-    # ── Balanced tuning ───────────────────────────────────────────────
     "gaussian_sigma": 1.3,
     "threshold_sigma": 2.0,
     "min_component_pixels": 15,
     "final_dilation": 3,
     "min_solidity": 0.35,
     "b12_epsilon": 1e-6,
+    "min_valid_ref_pixels": 50,   # relaxed from 100 → 50
 }
 
 
@@ -303,7 +304,6 @@ def download_scene(item, aoi, access_token):
 
 
 def download_s5p_scene(aoi, date_from, date_to, access_token):
-    """Download Sentinel-5P CH4 + dataMask for a given time window."""
     aoi = ensure_aoi(aoi)
     cache_id = hashlib.sha256(
         json.dumps(["s5p_ch4", aoi, str(date_from), str(date_to)], sort_keys=True).encode()
@@ -413,10 +413,7 @@ def run_algorithm(target, reference):
     mean_value = float(np.mean(values))
     std_value = float(np.std(values))
 
-    # Gaussian smoothing
     gaussian = gaussian_filter(np.where(finite, relative, mean_value), sigma=PARAMS["gaussian_sigma"])
-
-    # Threshold from RAW data
     threshold = mean_value + PARAMS["threshold_sigma"] * std_value
 
     initial = valid & np.isfinite(gaussian) & (gaussian > threshold)
@@ -425,7 +422,6 @@ def run_algorithm(target, reference):
     retained = np.where(sizes >= PARAMS["min_component_pixels"])[0]
     retained = retained[retained != 0]
 
-    # Shape-based noise filter (solidity)
     if len(retained) > 0:
         keep = set()
         try:
@@ -442,11 +438,9 @@ def run_algorithm(target, reference):
 
     connected = np.isin(labels, retained)
 
-    # Morphological opening → removes thin connections
     if connected.any():
         connected = binary_opening(connected, structure=disk(1))
 
-    # Remove isolated candidate pixels (salt-and-pepper)
     if connected.any():
         neighbor_count = convolve(
             connected.astype(np.uint8),
@@ -484,7 +478,7 @@ def save_raster(path, array, profile, mask=False):
 
 def create_map(aoi):
     geometry = shape(ensure_aoi(aoi))
-    fmap = folium.Map([geometry.centroid.y, geometry.centroid.x], zoom_start=12, tiles="OpenStreetMap")
+    fmap = folium.Map([geometry.centroid.y, geometry.centroid.x], zoom_start=11, tiles="OpenStreetMap")
     folium.GeoJson(mapping(geometry), style_function=lambda _: {"color": "blue", "fill": False}).add_to(fmap)
     Draw(export=True, draw_options={"polyline": False, "circle": False, "marker": False, "circlemarker": False}).add_to(fmap)
     return fmap
@@ -515,7 +509,6 @@ def image_png(array, mask=False):
 
 
 def ch4_anomaly_png(array):
-    """Special PNG for S5P CH4 highlighting small anomalies around the mean."""
     from PIL import Image
     import matplotlib.pyplot as plt
     data = np.asarray(array).astype(np.float32)
@@ -525,7 +518,6 @@ def ch4_anomaly_png(array):
         values = data[finite]
         mean_val = float(np.mean(values))
         anomaly = data - mean_val
-        # Symmetric scaling around zero
         max_abs = float(np.percentile(np.abs(anomaly[finite]), 98))
         if max_abs < 1e-6:
             max_abs = float(np.max(np.abs(anomaly[finite])))
@@ -589,17 +581,31 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
         candidates = same_tile if same_tile else reference_scenes
         best_ref_bands = None
         best_corr = -np.inf
+        best_valid_count = 0
         for ref in candidates:
             try:
                 ref_bands, _ = read_stack(download_scene(ref, aoi, access_token))
             except Exception:
                 continue
             valid_px = np.isfinite(target_bands["B04"]) & np.isfinite(ref_bands["B04"])
-            if valid_px.sum() > 100:
-                corr = float(np.corrcoef(target_bands["B04"][valid_px], ref_bands["B04"][valid_px])[0, 1])
+            valid_count = int(valid_px.sum())
+            if valid_count >= PARAMS["min_valid_ref_pixels"]:
+                t_vals = target_bands["B04"][valid_px]
+                r_vals = ref_bands["B04"][valid_px]
+                corr = np.nan
+                if np.std(t_vals) > 1e-9 and np.std(r_vals) > 1e-9:
+                    try:
+                        corr = float(np.corrcoef(t_vals, r_vals)[0, 1])
+                    except Exception:
+                        corr = np.nan
                 if np.isfinite(corr) and corr > best_corr:
                     best_corr = corr
                     best_ref_bands = ref_bands
+                    best_valid_count = valid_count
+                elif best_ref_bands is None and valid_count > best_valid_count:
+                    best_valid_count = valid_count
+                    best_ref_bands = ref_bands
+                    best_corr = np.nan
         if best_ref_bands is None:
             return None
         result = run_algorithm(target_bands, best_ref_bands)
@@ -721,7 +727,6 @@ with control_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">02 · SEARCH</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-title">Scene Search</div>', unsafe_allow_html=True)
-    # ── Default: last 30 days ─────────────────────────────────────────
     default_end = datetime.now().date()
     default_start = default_end - timedelta(days=30)
     d1, d2 = st.columns(2, gap="small")
@@ -914,29 +919,90 @@ with action_col:
                     progress_status.markdown('<div class="card-caption">Step 2 of 5 · Downloading target image bands and preparing the AOI…</div>', unsafe_allow_html=True)
                     progress.progress(25, text="Downloading target bands…")
                     target_bands, profile = read_stack(download_scene(target, st.session_state.aoi, access_token))
+
+                    # ── Robust reference selection ─────────────────────
                     best_reference = None
                     best_correlation = -np.inf
+                    best_valid_count = 0
                     reference_rows = []
                     total_refs = max(1, len(references))
+
                     for ref_index, reference in enumerate(references, start=1):
                         pct = 30 + int(40 * (ref_index - 1) / total_refs)
                         progress_status.markdown(f'<div class="card-caption">Step 3 of 5 · Downloading and comparing reference scene {ref_index} of {total_refs}…</div>', unsafe_allow_html=True)
                         progress.progress(pct, text=f"Reference scene {ref_index} of {total_refs}…")
-                        reference_bands, _ = read_stack(download_scene(reference, st.session_state.aoi, access_token))
+
+                        # Try to download; skip on failure
+                        try:
+                            reference_bands, _ = read_stack(download_scene(reference, st.session_state.aoi, access_token))
+                        except Exception as ref_err:
+                            reference_rows.append({
+                                "id": as_dict(reference).get("id"),
+                                "date": get_datetime(reference),
+                                "tile": get_tile(reference),
+                                "b4_correlation": np.nan,
+                                "valid_b4_pixels": 0,
+                                "status": f"download failed",
+                            })
+                            continue
+
                         valid_pixels = np.isfinite(target_bands["B04"]) & np.isfinite(reference_bands["B04"])
-                        correlation = float(np.corrcoef(target_bands["B04"][valid_pixels], reference_bands["B04"][valid_pixels])[0, 1]) if valid_pixels.sum() > 100 else np.nan
-                        reference_rows.append({"id": as_dict(reference).get("id"), "date": get_datetime(reference), "tile": get_tile(reference), "b4_correlation": correlation, "valid_b4_pixels": int(valid_pixels.sum())})
+                        valid_count = int(valid_pixels.sum())
+
+                        # Compute correlation if enough pixels and non-zero variance
+                        correlation = np.nan
+                        if valid_count >= PARAMS["min_valid_ref_pixels"]:
+                            t_vals = target_bands["B04"][valid_pixels]
+                            r_vals = reference_bands["B04"][valid_pixels]
+                            if np.std(t_vals) > 1e-9 and np.std(r_vals) > 1e-9:
+                                try:
+                                    correlation = float(np.corrcoef(t_vals, r_vals)[0, 1])
+                                except Exception:
+                                    correlation = np.nan
+
+                        reference_rows.append({
+                            "id": as_dict(reference).get("id"),
+                            "date": get_datetime(reference),
+                            "tile": get_tile(reference),
+                            "b4_correlation": correlation,
+                            "valid_b4_pixels": valid_count,
+                            "status": "ok" if np.isfinite(correlation) else "low-validity",
+                        })
+
+                        # Priority 1: best correlation
                         if np.isfinite(correlation) and correlation > best_correlation:
                             best_correlation = correlation
                             best_reference = reference_bands
+                            best_valid_count = valid_count
+                        # Priority 2 (fallback): most valid pixels if no correlation yet
+                        elif best_reference is None and valid_count > best_valid_count:
+                            best_valid_count = valid_count
+                            best_reference = reference_bands
+                            best_correlation = np.nan
+
                     st.session_state.reference_table = pd.DataFrame(reference_rows)
+
                     if best_reference is None:
-                        st.warning("Reference scenes were downloaded, but B4 correlation could not be calculated. Check valid pixels and cloud cover.")
+                        total_valid = sum(int(r.get("valid_b4_pixels", 0)) for r in reference_rows)
+                        target_valid = int(np.isfinite(target_bands["B04"]).sum())
+                        st.error(
+                            f"Could not select a reference scene.\n\n"
+                            f"- References downloaded: **{len(reference_rows)}**\n"
+                            f"- Total valid B4 pixels across all references: **{total_valid:,}**\n"
+                            f"- Target valid B4 pixels: **{target_valid:,}**\n\n"
+                            f"**Suggestions:**\n"
+                            f"1. Increase the **date range** (make start date earlier).\n"
+                            f"2. Increase the **cloud cover** threshold to 50–70%.\n"
+                            f"3. Increase **Reference window (days)** to 90.\n"
+                            f"4. Enlarge the AOI on the map (at least ~8×8 km)."
+                        )
                         st.stop()
+
+                    # ───────────────────────────────────────────────────
                     progress_status.markdown('<div class="card-caption">Step 4 of 5 · Running relative MBMP anomaly detection and candidate cleanup…</div>', unsafe_allow_html=True)
                     progress.progress(78, text="Running methane detection…")
                     result = run_algorithm(target_bands, best_reference)
-                    result["b4_correlation"] = best_correlation
+                    result["b4_correlation"] = best_correlation if np.isfinite(best_correlation) else float("nan")
                     result["date"] = target_date.strftime("%Y-%m-%d")
                     output_folder = RESULT_DIR / target_date.strftime("%Y%m%d")
                     output_folder.mkdir(parents=True, exist_ok=True)
@@ -969,7 +1035,8 @@ if "result" in st.session_state:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
     metrics = st.columns(6, gap="small")
-    metrics[0].metric("B4 correlation", f"{result['b4_correlation']:.3f}")
+    corr_text = f"{result['b4_correlation']:.3f}" if np.isfinite(result.get("b4_correlation", np.nan)) else "n/a"
+    metrics[0].metric("B4 correlation", corr_text)
     metrics[1].metric("Valid pixels", f"{result['valid_count']:,}")
     metrics[2].metric("Initial", f"{result['initial_count']:,}")
     metrics[3].metric("Final", f"{result['final_count']:,}")
@@ -1136,7 +1203,7 @@ if "result" in st.session_state:
     # ──────────────────────────────────────────────────────────────────
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km) for regional context. Visualization shows <b>anomaly relative to the local mean</b> so that small enhancements become visible. QA &lt; 0.5 filtered out.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km) for regional context. Visualization shows <b>anomaly relative to the local mean</b>. QA &lt; 0.5 filtered out.</div>', unsafe_allow_html=True)
 
     s5p_col1, s5p_col2 = st.columns([1, 3], gap="small")
     with s5p_col1:
@@ -1163,7 +1230,6 @@ if "result" in st.session_state:
                     qa = src.read(2).astype(np.float32)
                 else:
                     qa = np.ones_like(ch4)
-            # QA filter
             ch4[qa < 0.5] = np.nan
             st.session_state.s5p_ch4 = ch4
             st.success("S5P CH4 loaded")
@@ -1188,7 +1254,7 @@ if "result" in st.session_state:
             with leg_col:
                 st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
                 st.markdown(legend_html("s5p"), unsafe_allow_html=True)
-            st.markdown('<div class="card-caption">The visualization shows how each pixel deviates from the local mean (red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill may only occupy 1–2 pixels, so a clear plume pattern is not always resolvable.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="card-caption">Each pixel is shown as deviation from the local mean (red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill may only occupy 1–2 pixels.</div>', unsafe_allow_html=True)
         else:
             st.warning("Not enough valid S5P CH4 pixels. Increase the temporal window or check cloud cover.")
 
