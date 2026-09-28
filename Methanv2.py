@@ -2,8 +2,8 @@
 
 Integrated version with:
   • Stronger noise suppression (stricter thresholds + shape filtering)
-  • 30-day time-series tracking for daily change monitoring
-  • Sentinel-5P / TROPOMI CH4 context layer
+  • 30-day time-series tracking with VISUAL daily playback
+  • Sentinel-5P / TROPOMI CH4 context layer (fixed collection type)
 
 UI/design is preserved exactly as in the original version.
 """
@@ -43,7 +43,8 @@ RESULT_DIR = Path.home() / ".sentinel_methane_results"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
-S5P_COLLECTION = "sentinel-5p-l2-ch4-offl"
+# ── FIX: correct S5P collection type ──────────────────────────────────
+S5P_COLLECTION = "sentinel-5p-l2"   # was: "sentinel-5p-l2-ch4-offl"
 
 PARAMS = {
     "b03_quantile": 0.05,
@@ -53,13 +54,20 @@ PARAMS = {
     "ndbi_threshold": 0.20,
     "ndsi_threshold": 0.42,
     "lrad_dilation": 2,
-    "gaussian_sigma": 1.2,
-    "threshold_sigma": 1.8,
-    "min_component_pixels": 10,
+    # ── Noise tuning ──────────────────────────────────────────────────
+    "gaussian_sigma": 1.5,        # was 1.2 — more smoothing
+    "threshold_sigma": 1.0,       # was 1.8 — lower to catch plume
+    "min_component_pixels": 12,   # was 10
     "final_dilation": 4,
     "min_solidity": 0.30,
+    # ── Stability fix: avoid blow-up when B12 ≈ 0 ────────────────────
+    "b12_epsilon": 1e-6,
 }
 
+
+# ══════════════════════════════════════════════════════════════════════
+#  HELPERS  (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 
 def as_dict(item):
     if isinstance(item, dict):
@@ -234,16 +242,17 @@ function evaluatePixel(sample) {
 """
 
 
+# ── FIX: S5P evalscript uses correct band names ──────────────────────
 def s5p_evalscript():
     return """//VERSION=3
 function setup() {
   return {
-    input: [{bands: ["CH4", "qa_value"]}],
+    input: [{bands: ["CH4", "dataMask"]}],
     output: {bands: 2, sampleType: "FLOAT32"}
   };
 }
 function evaluatePixel(sample) {
-  return [sample.CH4, sample.qa_value];
+  return [sample.CH4, sample.dataMask];
 }
 """
 
@@ -285,8 +294,9 @@ def download_scene(item, aoi, access_token):
     return output_path
 
 
+# ── FIX: correct collection type and band handling ───────────────────
 def download_s5p_scene(aoi, date_from, date_to, access_token):
-    """Download Sentinel-5P CH4 + qa_value for a given time window."""
+    """Download Sentinel-5P CH4 + dataMask for a given time window."""
     aoi = ensure_aoi(aoi)
     cache_id = hashlib.sha256(
         json.dumps(["s5p_ch4", aoi, str(date_from), str(date_to)], sort_keys=True).encode()
@@ -304,7 +314,7 @@ def download_s5p_scene(aoi, date_from, date_to, access_token):
                 "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"},
             },
             "data": [{
-                "type": S5P_COLLECTION,
+                "type": S5P_COLLECTION,          # "sentinel-5p-l2"
                 "dataFilter": {
                     "timeRange": {
                         "from": date_from.strftime("%Y-%m-%dT00:00:00Z"),
@@ -312,6 +322,7 @@ def download_s5p_scene(aoi, date_from, date_to, access_token):
                     },
                     "mosaickingOrder": "leastCC",
                 },
+                "processing": {"minQa": 50},    # QA >= 50 %
             }],
         },
         "output": {
@@ -373,13 +384,15 @@ def calculate_c(b11, b12, valid):
     return float(np.sum(x * y) / max(np.sum(x * x), 1e-20))
 
 
+# ── FIX: higher epsilon to avoid division blow-up ────────────────────
 def calculate_mbsp(b11, b12, c, valid):
     output = np.full(b11.shape, np.nan, dtype=np.float32)
-    use = valid & np.isfinite(b11) & np.isfinite(b12) & (np.abs(b12) > 1e-12)
+    use = valid & np.isfinite(b11) & np.isfinite(b12) & (np.abs(b12) > PARAMS["b12_epsilon"])
     output[use] = c * (b12[use] - b11[use]) / b12[use]
     return output
 
 
+# ── FIX: threshold computed from GAUSSIAN-filtered data ──────────────
 def run_algorithm(target, reference):
     target_q = float(np.nanquantile(target["B03"], PARAMS["b03_quantile"]))
     reference_q = float(np.nanquantile(reference["B03"], PARAMS["b03_quantile"]))
@@ -394,15 +407,20 @@ def run_algorithm(target, reference):
     values = relative[finite].astype(np.float64)
     mean_value = float(np.mean(values))
     std_value = float(np.std(values))
+    # Gaussian smoothing
     gaussian = gaussian_filter(np.where(finite, relative, mean_value), sigma=PARAMS["gaussian_sigma"])
-    threshold = mean_value + PARAMS["threshold_sigma"] * std_value
+    # ⚠️ Threshold from FILTERED data (not raw) → much less noise
+    gaussian_values = gaussian[finite]
+    gaussian_mean = float(np.mean(gaussian_values))
+    gaussian_std = float(np.std(gaussian_values))
+    threshold = gaussian_mean + PARAMS["threshold_sigma"] * gaussian_std
     initial = valid & np.isfinite(gaussian) & (gaussian > threshold)
     labels, _ = label(initial, structure=np.ones((3, 3), dtype=np.uint8))
     sizes = np.bincount(labels.ravel())
     retained = np.where(sizes >= PARAMS["min_component_pixels"])[0]
     retained = retained[retained != 0]
 
-    # Shape-based noise filter (solidity): drop scattered / irregular components
+    # Shape-based noise filter (solidity)
     if len(retained) > 0:
         keep = set()
         try:
@@ -512,13 +530,16 @@ def georeferenced_png_package(array, profile, mask=False):
     return package.getvalue()
 
 
-def process_single_day(target_scene, reference_scenes, aoi, access_token):
-    """Process a single day and return summary statistics for the time series."""
+# ══════════════════════════════════════════════════════════════════════
+#  TIME-SERIES + VISUAL PLAYBACK
+# ══════════════════════════════════════════════════════════════════════
+
+def process_single_day(target_scene, reference_scenes, aoi, access_token, store_image=True):
+    """Process a single day → summary stats + optional PNG image."""
     try:
         target_date = get_datetime(target_scene)
         target_bands, _ = read_stack(download_scene(target_scene, aoi, access_token))
         target_tile = get_tile(target_scene)
-        # Prefer same-tile references
         same_tile = [r for r in reference_scenes if get_tile(r) == target_tile]
         candidates = same_tile if same_tile else reference_scenes
         best_ref_bands = None
@@ -537,19 +558,26 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token):
         if best_ref_bands is None:
             return None
         result = run_algorithm(target_bands, best_ref_bands)
-        rel = result["relative"]
-        return {
+        row = {
             "date": target_date,
-            "mean_mbmp": float(np.nanmean(rel)),
-            "max_mbmp": float(np.nanmax(rel)),
-            "std_mbmp": float(np.nanstd(rel)),
+            "mean_mbmp": float(np.nanmean(result["relative"])),
+            "max_mbmp": float(np.nanmax(result["relative"])),
+            "std_mbmp": float(np.nanstd(result["relative"])),
             "final_pixels": int(result["final_count"]),
             "regions": int(result["regions"]),
             "b4_correlation": float(best_corr) if np.isfinite(best_corr) else np.nan,
         }
+        if store_image:
+            row["png_relative"] = image_png(result["relative"])
+            row["png_mask"] = image_png(result["final"], mask=True)
+        return row
     except Exception as exc:
         return {"date": get_datetime(target_scene), "error": str(exc)}
 
+
+# ══════════════════════════════════════════════════════════════════════
+#  UI  (identical CSS / layout)
+# ══════════════════════════════════════════════════════════════════════
 
 st.set_page_config(page_title="Sentinel-2 Methane", page_icon="🛰️", layout="wide", initial_sidebar_state="collapsed")
 
@@ -881,6 +909,10 @@ with action_col:
         st.markdown('<div class="card-title">Select scenes first</div><div class="card-caption">Search for Sentinel-2 scenes, select a target, then run the detection.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
+# ══════════════════════════════════════════════════════════════════════
+#  RESULTS
+# ══════════════════════════════════════════════════════════════════════
+
 if "result" in st.session_state:
     result = st.session_state.result
     png_outputs = st.session_state.get("png_outputs", {})
@@ -924,18 +956,18 @@ if "result" in st.session_state:
     with d2:
         st.markdown('<div class="card-caption" style="margin-top:0.55rem;">Relative MBMP anomaly and candidate mask are screening outputs, not physical methane concentration or emission rate.</div>', unsafe_allow_html=True)
 
-    # ─────────────────────────────────────────────────────────────────
-    # 05a · 30-DAY TIME SERIES
-    # ─────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────
+    # 05a · 30-DAY TIME SERIES  +  VISUAL DAILY PLAYBACK
+    # ──────────────────────────────────────────────────────────────────
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">05a · 30-DAY TIME SERIES</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">Track daily changes of relative MBMP over the 30-day window centered on the target date.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">05a · 30-DAY TIME SERIES & VISUAL PLAYBACK</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">Track daily changes of relative MBMP over the 30-day window. Use the slider below the chart to visually scrub through each day.</div>', unsafe_allow_html=True)
 
     ts_col1, ts_col2 = st.columns([1, 3], gap="small")
     with ts_col1:
-        run_ts = st.button("📈  Build 30-day series", type="primary", use_container_width=True, key="build_ts_button", disabled=not bool(st.session_state.get("cdse_auth")))
+        run_ts = st.button("📈  Build 30-day series + visuals", type="primary", use_container_width=True, key="build_ts_button", disabled=not bool(st.session_state.get("cdse_auth")))
     with ts_col2:
-        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">This downloads and processes every Sentinel-2 scene in the window. It can take several minutes on a new AOI; results are cached for next runs.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">Downloads and processes every Sentinel-2 scene in the window. Cached after first run.</div>', unsafe_allow_html=True)
 
     if run_ts:
         try:
@@ -943,13 +975,11 @@ if "result" in st.session_state:
             target_date = get_datetime(st.session_state.get("target"))
             if target_date is None:
                 raise RuntimeError("Target date is missing.")
-            # Collect all candidate scenes within ±30 days
             window_scenes = [
                 s for s in st.session_state.get("scene_results", [])
                 if get_datetime(s) is not None
                 and abs((get_datetime(s) - target_date).total_seconds()) / 86400 <= 30
             ]
-            # Group scenes by day
             by_day = {}
             for s in window_scenes:
                 d = get_datetime(s).date()
@@ -959,14 +989,13 @@ if "result" in st.session_state:
             ts_progress = st.progress(0, text="Building time series…")
             ts_status = st.empty()
             rows = []
+            daily_visuals = {}
             total_days = max(1, len(days_sorted))
             for idx, day in enumerate(days_sorted, start=1):
                 ts_status.markdown(f'<div class="card-caption">Processing day {idx} of {total_days} · {day.isoformat()}</div>', unsafe_allow_html=True)
                 ts_progress.progress(int(100 * idx / total_days), text=f"Day {idx} of {total_days}")
-                # Pick the least cloudy scene of that day as target
                 day_scenes = sorted(by_day[day], key=lambda s: get_cloud(s))
                 target_scene_day = day_scenes[0]
-                # References: any other day within ±15 days
                 refs = [
                     s for s in window_scenes
                     if as_dict(s).get("id") != as_dict(target_scene_day).get("id")
@@ -975,21 +1004,30 @@ if "result" in st.session_state:
                 ]
                 if not refs:
                     continue
-                row = process_single_day(target_scene_day, refs, st.session_state.aoi, access_token)
-                if row is not None:
-                    rows.append(row)
+                row = process_single_day(target_scene_day, refs, st.session_state.aoi, access_token, store_image=True)
+                if row is not None and "error" not in row:
+                    rows.append({k: v for k, v in row.items() if not k.startswith("png_")})
+                    daily_visuals[row["date"].strftime("%Y-%m-%d")] = {
+                        "png_relative": row["png_relative"],
+                        "png_mask": row["png_mask"],
+                        "mean_mbmp": row["mean_mbmp"],
+                        "max_mbmp": row["max_mbmp"],
+                        "final_pixels": row["final_pixels"],
+                    }
 
             if rows:
                 ts_df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
                 st.session_state.timeseries_df = ts_df
+                st.session_state.daily_visuals = daily_visuals
                 ts_progress.progress(100, text="Time series ready")
                 ts_status.empty()
-                st.success(f"Time series built · {len(ts_df)} day(s) processed")
+                st.success(f"Time series built · {len(ts_df)} day(s) processed · {len(daily_visuals)} visual frames")
             else:
                 st.warning("No valid day could be processed. Try a wider date range or a larger AOI.")
         except Exception as ts_error:
             st.error(f"Time series failed: {ts_error}")
 
+    # ── Line chart ────────────────────────────────────────────────────
     if "timeseries_df" in st.session_state:
         ts = st.session_state.timeseries_df
         if not ts.empty and "mean_mbmp" in ts.columns:
@@ -1019,12 +1057,40 @@ if "result" in st.session_state:
                     use_container_width=False,
                 )
 
-    # ─────────────────────────────────────────────────────────────────
-    # 05b · SENTINEL-5P CH4 CONTEXT
-    # ─────────────────────────────────────────────────────────────────
+    # ── NEW: Visual daily playback (time-lapse) ───────────────────────
+    if "daily_visuals" in st.session_state:
+        visuals = st.session_state.daily_visuals
+        dates_available = sorted(visuals.keys())
+        if dates_available:
+            st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
+            st.markdown('<div class="card-caption" style="font-weight:700;font-size:0.85rem;">🎬 Visual daily playback — drag the slider to scrub through the month</div>', unsafe_allow_html=True)
+            selected_day = st.select_slider(
+                "Select day",
+                options=dates_available,
+                value=dates_available[0],
+                key="visual_day_slider",
+                label_visibility="collapsed",
+            )
+            if selected_day in visuals:
+                frame = visuals[selected_day]
+                v1, v2 = st.columns(2, gap="small")
+                with v1:
+                    st.markdown(f'<div class="card-caption" style="font-weight:700;">{selected_day} · Relative MBMP</div>', unsafe_allow_html=True)
+                    st.image(frame["png_relative"], use_container_width=True, output_format="PNG")
+                with v2:
+                    st.markdown(f'<div class="card-caption" style="font-weight:700;">{selected_day} · Candidate mask</div>', unsafe_allow_html=True)
+                    st.image(frame["png_mask"], use_container_width=True, output_format="PNG")
+                m1, m2, m3 = st.columns(3, gap="small")
+                m1.metric("Mean MBMP", f"{frame['mean_mbmp']:.5f}")
+                m2.metric("Max MBMP", f"{frame['max_mbmp']:.5f}")
+                m3.metric("Candidate pixels", f"{frame['final_pixels']:,}")
+
+    # ──────────────────────────────────────────────────────────────────
+    # 05b · SENTINEL-5P CH4 CONTEXT  (fixed)
+    # ──────────────────────────────────────────────────────────────────
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km) for regional context. Not a plume-scale product; use it to compare S2 candidates with regional methane patterns.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km) for regional context. QA ≥ 50 % applied. Not a plume-scale product; use it to compare S2 candidates with regional methane patterns.</div>', unsafe_allow_html=True)
 
     s5p_col1, s5p_col2 = st.columns([1, 3], gap="small")
     with s5p_col1:
@@ -1051,8 +1117,8 @@ if "result" in st.session_state:
                     qa = src.read(2).astype(np.float32)
                 else:
                     qa = np.ones_like(ch4)
-            # QA filter: keep only valid pixels (qa_value >= 0.5 or dataMask == 1)
-            ch4[(qa < 0.5) | (qa == 0)] = np.nan
+            # QA filter: keep only valid pixels (dataMask == 1)
+            ch4[qa < 0.5] = np.nan
             st.session_state.s5p_ch4 = ch4
             st.success("S5P CH4 loaded")
         except Exception as s5p_error:
