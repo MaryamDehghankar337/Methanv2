@@ -3,10 +3,10 @@
 Integrated version:
   • Aradkouh landfill (Tehran) as default AOI
   • Cloud cover 30% + last-30-days date defaults
-  • Balanced noise / signal tuning
+  • Strong noise suppression + signal-ratio warning
   • Robust reference selection with fallback
   • 30-day time-series + visual daily playback
-  • Sentinel-5P CH4 context with anomaly-based visualization
+  • Sentinel-5P CH4 with forced AOI-center display
 
 UI/design preserved from the original version.
 """
@@ -54,7 +54,7 @@ RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 S5P_COLLECTION = "sentinel-5p-l2"
 
-# ── Default AOI: Aradkouh landfill (Tehran) — wider for more valid pixels
+# ── Default AOI: Aradkouh landfill (Tehran) ──────────────────────────
 DEFAULT_AOI = box(51.20, 35.40, 51.45, 35.60)
 
 PARAMS = {
@@ -65,13 +65,14 @@ PARAMS = {
     "ndbi_threshold": 0.20,
     "ndsi_threshold": 0.42,
     "lrad_dilation": 2,
-    "gaussian_sigma": 1.3,
-    "threshold_sigma": 2.0,
-    "min_component_pixels": 15,
-    "final_dilation": 3,
-    "min_solidity": 0.35,
+    # ── STRICT noise suppression ──────────────────────────────────────
+    "gaussian_sigma": 1.5,
+    "threshold_sigma": 3.5,
+    "min_component_pixels": 30,
+    "final_dilation": 2,
+    "min_solidity": 0.60,
     "b12_epsilon": 1e-6,
-    "min_valid_ref_pixels": 50,   # relaxed from 100 → 50
+    "min_valid_ref_pixels": 50,
 }
 
 
@@ -253,6 +254,7 @@ function evaluatePixel(sample) {
 
 
 def s5p_evalscript():
+    """Always return dataMask=1 so pixels are never filtered out."""
     return """//VERSION=3
 function setup() {
   return {
@@ -261,7 +263,8 @@ function setup() {
   };
 }
 function evaluatePixel(sample) {
-  return [sample.CH4, sample.dataMask];
+  // FORCE dataMask=1: never drop a pixel, even if QA is low.
+  return [sample.CH4, 1.0];
 }
 """
 
@@ -304,9 +307,10 @@ def download_scene(item, aoi, access_token):
 
 
 def download_s5p_scene(aoi, date_from, date_to, access_token):
+    """Download Sentinel-5P CH4. No mosaickingOrder, no minQa — accept all pixels."""
     aoi = ensure_aoi(aoi)
     cache_id = hashlib.sha256(
-        json.dumps(["s5p_ch4", aoi, str(date_from), str(date_to)], sort_keys=True).encode()
+        json.dumps(["s5p_ch4_v3", aoi, str(date_from), str(date_to)], sort_keys=True).encode()
     ).hexdigest()[:24]
     folder = CACHE_DIR / f"s5p_{cache_id}"
     output_path = folder / "ch4.tif"
@@ -327,8 +331,9 @@ def download_s5p_scene(aoi, date_from, date_to, access_token):
                         "from": date_from.strftime("%Y-%m-%dT00:00:00Z"),
                         "to": date_to.strftime("%Y-%m-%dT23:59:59Z"),
                     },
-                    "mosaickingOrder": "mostRecent",
+                    # No mosaickingOrder — let the API use its default.
                 },
+                # No processing.minQa — accept all pixels.
             }],
         },
         "output": {
@@ -509,6 +514,7 @@ def image_png(array, mask=False):
 
 
 def ch4_anomaly_png(array):
+    """Special PNG for S5P CH4 highlighting anomalies relative to local mean."""
     from PIL import Image
     import matplotlib.pyplot as plt
     data = np.asarray(array).astype(np.float32)
@@ -569,7 +575,7 @@ def georeferenced_png_package(array, profile, mask=False):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  TIME-SERIES + VISUAL PLAYBACK
+#  TIME-SERIES
 # ══════════════════════════════════════════════════════════════════════
 
 def process_single_day(target_scene, reference_scenes, aoi, access_token, store_image=True):
@@ -842,7 +848,7 @@ with settings_col:
     st.markdown('<div class="section-label">03 · DETECTION</div>', unsafe_allow_html=True)
     p1, p2, p3 = st.columns(3, gap="small")
     with p1:
-        PARAMS["threshold_sigma"] = st.number_input("Threshold multiplier", min_value=0.1, max_value=5.0, value=float(PARAMS["threshold_sigma"]), step=0.1, key="threshold_sigma")
+        PARAMS["threshold_sigma"] = st.number_input("Threshold multiplier", min_value=0.1, max_value=6.0, value=float(PARAMS["threshold_sigma"]), step=0.1, key="threshold_sigma")
     with p2:
         PARAMS["min_component_pixels"] = st.number_input("Minimum candidate pixels", min_value=2, max_value=1000, value=int(PARAMS["min_component_pixels"]), step=5, key="min_component_pixels")
     with p3:
@@ -920,7 +926,7 @@ with action_col:
                     progress.progress(25, text="Downloading target bands…")
                     target_bands, profile = read_stack(download_scene(target, st.session_state.aoi, access_token))
 
-                    # ── Robust reference selection ─────────────────────
+                    # ── Robust reference selection ────────────────────
                     best_reference = None
                     best_correlation = -np.inf
                     best_valid_count = 0
@@ -932,24 +938,22 @@ with action_col:
                         progress_status.markdown(f'<div class="card-caption">Step 3 of 5 · Downloading and comparing reference scene {ref_index} of {total_refs}…</div>', unsafe_allow_html=True)
                         progress.progress(pct, text=f"Reference scene {ref_index} of {total_refs}…")
 
-                        # Try to download; skip on failure
                         try:
                             reference_bands, _ = read_stack(download_scene(reference, st.session_state.aoi, access_token))
-                        except Exception as ref_err:
+                        except Exception:
                             reference_rows.append({
                                 "id": as_dict(reference).get("id"),
                                 "date": get_datetime(reference),
                                 "tile": get_tile(reference),
                                 "b4_correlation": np.nan,
                                 "valid_b4_pixels": 0,
-                                "status": f"download failed",
+                                "status": "download failed",
                             })
                             continue
 
                         valid_pixels = np.isfinite(target_bands["B04"]) & np.isfinite(reference_bands["B04"])
                         valid_count = int(valid_pixels.sum())
 
-                        # Compute correlation if enough pixels and non-zero variance
                         correlation = np.nan
                         if valid_count >= PARAMS["min_valid_ref_pixels"]:
                             t_vals = target_bands["B04"][valid_pixels]
@@ -969,12 +973,10 @@ with action_col:
                             "status": "ok" if np.isfinite(correlation) else "low-validity",
                         })
 
-                        # Priority 1: best correlation
                         if np.isfinite(correlation) and correlation > best_correlation:
                             best_correlation = correlation
                             best_reference = reference_bands
                             best_valid_count = valid_count
-                        # Priority 2 (fallback): most valid pixels if no correlation yet
                         elif best_reference is None and valid_count > best_valid_count:
                             best_valid_count = valid_count
                             best_reference = reference_bands
@@ -994,16 +996,20 @@ with action_col:
                             f"1. Increase the **date range** (make start date earlier).\n"
                             f"2. Increase the **cloud cover** threshold to 50–70%.\n"
                             f"3. Increase **Reference window (days)** to 90.\n"
-                            f"4. Enlarge the AOI on the map (at least ~8×8 km)."
+                            f"4. Enlarge the AOI on the map (at least ~30×30 km)."
                         )
                         st.stop()
 
-                    # ───────────────────────────────────────────────────
                     progress_status.markdown('<div class="card-caption">Step 4 of 5 · Running relative MBMP anomaly detection and candidate cleanup…</div>', unsafe_allow_html=True)
                     progress.progress(78, text="Running methane detection…")
                     result = run_algorithm(target_bands, best_reference)
                     result["b4_correlation"] = best_correlation if np.isfinite(best_correlation) else float("nan")
                     result["date"] = target_date.strftime("%Y-%m-%d")
+
+                    # ── Signal-ratio sanity check ─────────────────────
+                    signal_ratio = result["final_count"] / max(1, result["valid_count"])
+                    result["signal_ratio"] = float(signal_ratio)
+
                     output_folder = RESULT_DIR / target_date.strftime("%Y%m%d")
                     output_folder.mkdir(parents=True, exist_ok=True)
                     paths = {}
@@ -1017,6 +1023,16 @@ with action_col:
                     progress_status.markdown('<div class="card-caption">Step 5 of 5 · Saving georeferenced outputs and preparing downloads…</div>', unsafe_allow_html=True)
                     progress.progress(100, text="Ready to detect · outputs are ready")
                     st.success("Processing completed")
+
+                    if signal_ratio < 0.0005:
+                        st.warning(
+                            f"⚠️ **Low signal-to-noise ratio detected.** "
+                            f"The final candidate mask covers only **{signal_ratio*100:.4f}%** of valid pixels "
+                            f"({result['final_count']:,} / {result['valid_count']:,}). "
+                            f"This is likely **noise**, not a real methane plume. "
+                            f"Try increasing the threshold multiplier to 4.0–5.0, or pick a "
+                            f"different target/reference date pair."
+                        )
                 except Exception as error:
                     st.error(f"Detection failed: {error}")
     else:
@@ -1072,7 +1088,7 @@ if "result" in st.session_state:
         st.markdown('<div class="card-caption" style="margin-top:0.55rem;">Relative MBMP anomaly and candidate mask are screening outputs, not physical methane concentration or emission rate.</div>', unsafe_allow_html=True)
 
     # ──────────────────────────────────────────────────────────────────
-    # 05a · 30-DAY TIME SERIES  +  VISUAL DAILY PLAYBACK
+    # 05a · 30-DAY TIME SERIES
     # ──────────────────────────────────────────────────────────────────
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05a · 30-DAY TIME SERIES & VISUAL PLAYBACK</div>', unsafe_allow_html=True)
@@ -1203,7 +1219,7 @@ if "result" in st.session_state:
     # ──────────────────────────────────────────────────────────────────
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km) for regional context. Visualization shows <b>anomaly relative to the local mean</b>. QA &lt; 0.5 filtered out.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). All pixels are shown (no QA filtering). Visualization is <b>anomaly relative to the local mean</b>.</div>', unsafe_allow_html=True)
 
     s5p_col1, s5p_col2 = st.columns([1, 3], gap="small")
     with s5p_col1:
@@ -1226,11 +1242,9 @@ if "result" in st.session_state:
                 )
             with rasterio.open(s5p_path) as src:
                 ch4 = src.read(1).astype(np.float32)
-                if src.count > 1:
-                    qa = src.read(2).astype(np.float32)
-                else:
-                    qa = np.ones_like(ch4)
-            ch4[qa < 0.5] = np.nan
+            # Keep all finite pixels (do NOT filter by qa)
+            ch4[~np.isfinite(ch4)] = np.nan
+            ch4[ch4 <= 0] = np.nan
             st.session_state.s5p_ch4 = ch4
             st.success("S5P CH4 loaded")
         except Exception as s5p_error:
@@ -1239,6 +1253,18 @@ if "result" in st.session_state:
     if "s5p_ch4" in st.session_state:
         ch4 = st.session_state.s5p_ch4
         valid_ch4 = ch4[np.isfinite(ch4)]
+
+        # ── Fallback: fill with placeholder if no valid pixels ──────
+        if valid_ch4.size < 2:
+            placeholder = float(np.nanmean(valid_ch4)) if valid_ch4.size > 0 else 1900.0
+            ch4 = np.full_like(ch4, placeholder)
+            valid_ch4 = ch4[np.isfinite(ch4)]
+            st.warning(
+                "⚠️ Sentinel-5P returned no valid pixels for this AOI and time window "
+                "(cloud cover / QA). Showing the AOI center with a placeholder value. "
+                "Try increasing the temporal window to 30 days."
+            )
+
         if valid_ch4.size > 1:
             mean_val = float(np.nanmean(valid_ch4))
             max_val = float(np.nanmax(valid_ch4))
@@ -1256,6 +1282,6 @@ if "result" in st.session_state:
                 st.markdown(legend_html("s5p"), unsafe_allow_html=True)
             st.markdown('<div class="card-caption">Each pixel is shown as deviation from the local mean (red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill may only occupy 1–2 pixels.</div>', unsafe_allow_html=True)
         else:
-            st.warning("Not enough valid S5P CH4 pixels. Increase the temporal window or check cloud cover.")
+            st.warning("Not enough valid S5P CH4 pixels even after fallback. Increase the temporal window to 30 days.")
 
     st.markdown('</div>', unsafe_allow_html=True)
