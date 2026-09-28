@@ -1,6 +1,6 @@
 """Sentinel-2 methane candidate screening app.
 
-MBMC-faithful v3 (final)
+MBMC-faithful v4 (edge-margin + outlier-clip)
   • Aradkouh landfill (Tehran) as default AOI
   • Cloud cover 30% + last-30-days date defaults
   • Robust reference selection with fallback
@@ -8,8 +8,6 @@ MBMC-faithful v3 (final)
   • Sentinel-5P CH4 with forced AOI-center display
 
 UI/design preserved from the original version.
-Algorithm engine re-implemented following the MBMC paper,
-with robust median/MAD thresholding and higher smoothing.
 """
 from __future__ import annotations
 
@@ -70,9 +68,14 @@ K_MBMP = 1.0e-5
 DETREND_SIGMA = 150.0
 ABS_FLOOR_PPB = 20.0
 N_SIGMA = 2.5
-GAUSS_SIGMA = 3.0          # ← تغییر ۱: از 1.5 به 3.0
+GAUSS_SIGMA = 3.0
 FLOOD_MIN_SIZE = 10
 DILATE_RADIUS_FINAL = 3
+
+# ── Robustness: edge margin & outlier clipping ───────────────────────
+EDGE_MARGIN_PX = 20        # pixels dropped at image borders
+CLIP_PPB = 5000.0          # hard cap on |ΔΩ| before stats
+DISPLAY_SIGMA = 5.0        # symmetric display stretch
 
 PARAMS = {
     "b03_quantile": 0.05,
@@ -94,6 +97,8 @@ PARAMS = {
     "k_mbmp": K_MBMP,
     "max_plume_area_km2": 10.0,
     "site_radius_m": SITE_RADIUS_M,
+    "edge_margin_px": EDGE_MARGIN_PX,
+    "clip_ppb": CLIP_PPB,
 }
 
 
@@ -391,8 +396,24 @@ def normalized_difference(first, second):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  CORE ALGORITHM (MBMC-faithful + robust thresholding)
+#  CORE ALGORITHM (MBMC + edge margin + outlier clip)
 # ══════════════════════════════════════════════════════════════════════
+
+def apply_edge_margin(mask, margin=EDGE_MARGIN_PX):
+    """Drop pixels within `margin` of the image border."""
+    if margin <= 0:
+        return mask
+    h, w = mask.shape
+    margin = min(margin, h // 4, w // 4)
+    if margin <= 0:
+        return mask
+    result = mask.copy()
+    result[:margin, :] = False
+    result[-margin:, :] = False
+    result[:, :margin] = False
+    result[:, -margin:] = False
+    return result
+
 
 def calculate_lrad(bands, q_value):
     finite = np.logical_and.reduce([np.isfinite(bands[band]) for band in BANDS])
@@ -492,24 +513,38 @@ def _robust_stats(values):
 
 
 def run_algorithm(target, reference, profile):
+    # 1. LRAD + edge margin
     target_q = float(np.nanquantile(target["B03"], PARAMS["b03_quantile"]))
     valid = calculate_lrad(target, target_q)
+    valid = apply_edge_margin(valid, EDGE_MARGIN_PX)
     if valid.sum() < 100:
-        raise RuntimeError("LRAD removed nearly all pixels. Relax thresholds or enlarge AOI.")
+        raise RuntimeError("LRAD + edge margin removed nearly all pixels.")
 
+    # 2. c
     c = calculate_c(target["B11"], target["B12"], valid)
+
+    # 3. ΔR on both
     dR_t = calculate_delta_R(target["B11"], target["B12"], c, valid)
     dR_r = calculate_delta_R(reference["B11"], reference["B12"], c, valid)
 
+    # 4. ΔΩ
     dOmega_t = dR_t / K_MBMP
     dOmega_r = dR_r / K_MBMP
     dOmega = dOmega_t - dOmega_r
     dOmega[~valid] = np.nan
 
+    # 5. Detrend
     dOmega_detrended, _ = remove_large_scale_background(dOmega, valid, sigma=DETREND_SIGMA)
+    dOmega_detrended[~valid] = np.nan
+
+    # 6. Gaussian smoothing
     d_smooth = normalized_gaussian(dOmega_detrended, valid, GAUSS_SIGMA)
 
-    vals = d_smooth[np.isfinite(d_smooth)]
+    # 7. Clip outliers before computing stats (removes bias)
+    clip = PARAMS["clip_ppb"]
+    finite_mask = np.isfinite(d_smooth) & valid
+    d_smooth_clipped = np.where(np.abs(d_smooth) > clip, np.nan, d_smooth)
+    vals = d_smooth_clipped[finite_mask & np.isfinite(d_smooth_clipped)]
     if vals.size == 0:
         raise RuntimeError("No finite values after detrending. Try a different reference scene.")
 
@@ -519,11 +554,14 @@ def run_algorithm(target, reference, profile):
         PARAMS["abs_floor_ppb"],
     )
 
-    candidate = np.isfinite(d_smooth) & (d_smooth > threshold) & valid
+    # Candidate uses the CLIPPED field so spurious spikes don't pass
+    candidate = finite_mask & np.isfinite(d_smooth_clipped) & (d_smooth_clipped > threshold)
 
+    # 8. Spatial constraint
     spatial_mask, site_rc = make_spatial_mask(dOmega.shape, profile)
     candidate &= spatial_mask
 
+    # 9. Keep largest component (paper convention)
     structure = np.ones((3, 3), dtype=np.uint8)
     labeled, n_labels = label(candidate, structure=structure)
     plume = np.zeros_like(candidate, dtype=bool)
@@ -586,6 +624,7 @@ def create_map(aoi):
 
 
 def image_png(array, mask=False):
+    """PNG renderer. Continuous data: symmetric stretch around median using robust σ."""
     from PIL import Image
     data = np.asarray(array)
     if mask:
@@ -596,11 +635,18 @@ def image_png(array, mask=False):
         rgb = np.full((*data.shape, 3), 255, dtype=np.uint8)
         if finite.any():
             values = data[finite]
-            low, high = float(np.percentile(values, 2)), float(np.percentile(values, 98))
+            # Robust symmetric center and scale
+            med = float(np.median(values))
+            mad = float(np.median(np.abs(values - med)))
+            sigma = 1.4826 * mad if mad > 1e-9 else float(np.std(values))
+            if not np.isfinite(sigma) or sigma <= 0:
+                sigma = 1.0
+            low = med - DISPLAY_SIGMA * sigma
+            high = med + DISPLAY_SIGMA * sigma
             if high <= low:
                 low, high = float(values.min()), float(values.max())
             if high > low:
-                normalized = np.clip((np.nan_to_num(data, nan=low) - low) / (high - low), 0, 1)
+                normalized = np.clip((np.nan_to_num(data, nan=med) - low) / (high - low), 0, 1)
                 import matplotlib.pyplot as plt
                 rgb = (plt.get_cmap("RdBu_r")(normalized)[:, :, :3] * 255).astype(np.uint8)
                 rgb[~finite] = 255
@@ -711,7 +757,6 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
         if best_ref_bands is None:
             return None
         result = run_algorithm(target_bands, best_ref_bands, target_profile)
-        # ← تغییر ۲: mean/max/std از detrended محاسبه می‌شن
         row = {
             "date": target_date,
             "mean_mbmp": float(np.nanmean(result["detrended"])),
@@ -1165,8 +1210,6 @@ if "result" in st.session_state:
     metrics[3].metric("Final", f"{result['final_count']:,}")
     metrics[4].metric("Regions", result["regions"])
     metrics[5].metric("Threshold", f"{result['threshold']:.2f}")
-
-    # ← تغییر ۳: پنل‌های بالا حالا detrended اول، و valid آخر
     result_items = [
         ("detrended", "ΔΩ after detrend (ppb)", "Detrended"),
         ("gaussian", "Gaussian smoothed", "Smoothed"),
@@ -1201,7 +1244,7 @@ if "result" in st.session_state:
             st.markdown('</div>', unsafe_allow_html=True)
 
     removed_pixels = max(0, int(result["initial_count"]) - int(result["final_count"]))
-    st.markdown(f'<div class="result-note"><b>Robust thresholding:</b> median = <b>{result["mean"]:.2f} ppb</b>, robust σ = <b>{result["std"]:.2f} ppb</b>, threshold = <b>{result["threshold"]:.2f} ppb</b>. Only the largest connected region ≥ <b>{int(PARAMS["min_component_pixels"]):,} px</b> was kept (MBMC convention). Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · c = <b>{result["c"]:.4f}</b> · detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="result-note"><b>Robust pipeline:</b> edge margin = <b>{EDGE_MARGIN_PX} px</b> · outlier clip = <b>±{CLIP_PPB:.0f} ppb</b> · median = <b>{result["mean"]:.2f} ppb</b> · robust σ = <b>{result["std"]:.2f} ppb</b> · threshold = <b>{result["threshold"]:.2f} ppb</b>. Only the largest connected region ≥ <b>{int(PARAMS["min_component_pixels"]):,} px</b> was kept. Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · c = <b>{result["c"]:.4f}</b> · detrend σ = <b>{DETREND_SIGMA:.0f} px</b>.</div>', unsafe_allow_html=True)
     d1, d2 = st.columns([1, 3], gap="small")
     with d1:
         st.download_button("⬇ Reference table CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection.csv", mime="text/csv", key="download_reference_csv_compact", use_container_width=True)
