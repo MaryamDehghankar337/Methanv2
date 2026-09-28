@@ -1,6 +1,6 @@
 """Sentinel-2 methane candidate screening app.
 
-Integrated version:
+MBMC-faithful version (Cheng et al., Remote Sensing 2026)
   • Aradkouh landfill (Tehran) as default AOI
   • Cloud cover 30% + last-30-days date defaults
   • Strong noise suppression + signal-ratio warning
@@ -9,6 +9,16 @@ Integrated version:
   • Sentinel-5P CH4 with forced AOI-center display
 
 UI/design preserved from the original version.
+Algorithm engine re-implemented following the MBMC paper:
+  - c = Σ(B11·B12) / Σ(B12²)          [B12 in denominator]
+  - ΔR = (c·B12 − B11) / B12
+  - ΔΩ = ΔR / K_MBMP                    (K = 1e-5 → ppb)
+  - Large-scale background removal (σ = 100 px)
+  - Gaussian smoothing σ = 0.5
+  - Threshold = max(mean + 1σ, 5 ppb)
+  - LRAD only on target; shared c for both
+  - Keep only the largest connected component
+  - Spatial constraint: 10 km around Aradkouh landfill
 """
 from __future__ import annotations
 
@@ -27,6 +37,8 @@ import numpy as np
 import pandas as pd
 import requests
 import rasterio
+import rasterio.transform
+from rasterio.warp import transform as rio_transform
 import streamlit as st
 from folium.plugins import Draw
 from scipy.ndimage import (
@@ -57,22 +69,41 @@ S5P_COLLECTION = "sentinel-5p-l2"
 # ── Default AOI: Aradkouh landfill (Tehran) ──────────────────────────
 DEFAULT_AOI = box(51.20, 35.40, 51.45, 35.60)
 
+# ── Aradkouh landfill site (spatial constraint center) ───────────────
+SITE_LAT = 35.505
+SITE_LON = 51.330
+SITE_RADIUS_M = 10000.0
+
+# ── MBMC paper constants ─────────────────────────────────────────────
+K_MBMP = 1.0e-5          # ppb conversion factor
+DETREND_SIGMA = 100.0    # large-scale background removal (px)
+ABS_FLOOR_PPB = 5.0      # absolute detection floor (ppb)
+N_SIGMA = 1.0            # threshold multiplier (paper default)
+GAUSS_SIGMA = 0.5        # pre-threshold smoothing
+FLOOD_MIN_SIZE = 15      # minimum connected-component size
+DILATE_RADIUS_FINAL = 3  # final plume dilation (iterations)
+
 PARAMS = {
     "b03_quantile": 0.05,
     "swir_saturation": 1.0,
     "ndwi_threshold": 0.20,
-    "ndvi_threshold": 0.30,
-    "ndbi_threshold": 0.20,
+    "ndvi_threshold": 0.40,   # relaxed for landfill/urban surroundings
+    "ndbi_threshold": 0.35,   # relaxed so landfill surface isn't removed
     "ndsi_threshold": 0.42,
-    "lrad_dilation": 2,
-    # ── STRICT noise suppression ──────────────────────────────────────
-    "gaussian_sigma": 1.5,
-    "threshold_sigma": 3.5,
-    "min_component_pixels": 30,
-    "final_dilation": 2,
-    "min_solidity": 0.60,
+    "lrad_dilation": 1,       # paper uses 1 iteration
+    # ── MBMC-aligned segmentation ────────────────────────────────
+    "gaussian_sigma": GAUSS_SIGMA,
+    "threshold_sigma": N_SIGMA,
+    "min_component_pixels": FLOOD_MIN_SIZE,
+    "final_dilation": DILATE_RADIUS_FINAL,
+    "min_solidity": 0.0,      # disabled (paper doesn't use solidity)
     "b12_epsilon": 1e-6,
     "min_valid_ref_pixels": 50,
+    "abs_floor_ppb": ABS_FLOOR_PPB,
+    "detrend_sigma": DETREND_SIGMA,
+    "k_mbmp": K_MBMP,
+    "max_plume_area_km2": 10.0,
+    "site_radius_m": SITE_RADIUS_M,
 }
 
 
@@ -331,9 +362,7 @@ def download_s5p_scene(aoi, date_from, date_to, access_token):
                         "from": date_from.strftime("%Y-%m-%dT00:00:00Z"),
                         "to": date_to.strftime("%Y-%m-%dT23:59:59Z"),
                     },
-                    # No mosaickingOrder — let the API use its default.
                 },
-                # No processing.minQa — accept all pixels.
             }],
         },
         "output": {
@@ -374,7 +403,12 @@ def normalized_difference(first, second):
     return output
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  CORE ALGORITHM (MBMC-faithful)
+# ══════════════════════════════════════════════════════════════════════
+
 def calculate_lrad(bands, q_value):
+    """Learning-based Robust Anomaly Detection mask (paper Algorithm 1)."""
     finite = np.logical_and.reduce([np.isfinite(bands[band]) for band in BANDS])
     artifact = ((bands["B11"] >= PARAMS["swir_saturation"]) & (bands["B12"] >= PARAMS["swir_saturation"]))
     artifact |= bands["B03"] <= q_value
@@ -383,93 +417,180 @@ def calculate_lrad(bands, q_value):
     artifact |= normalized_difference(bands["B11"], bands["B08"]) >= PARAMS["ndbi_threshold"]
     artifact |= normalized_difference(bands["B03"], bands["B11"]) >= PARAMS["ndsi_threshold"]
     artifact |= ~finite
-    artifact = binary_dilation(artifact, structure=disk(PARAMS["lrad_dilation"]))
+    if PARAMS["lrad_dilation"] > 0:
+        artifact = binary_dilation(artifact, iterations=int(PARAMS["lrad_dilation"]))
     return finite & ~artifact
 
 
 def calculate_c(b11, b12, valid):
-    use = valid & np.isfinite(b11) & np.isfinite(b12) & (b11 > 0) & (b12 > 0)
+    """Paper formula: c = Σ(B11·B12) / Σ(B12²)."""
+    use = valid & np.isfinite(b11) & np.isfinite(b12) & (b11 > 0.05) & (b12 > 0.05)
     if use.sum() < 100:
         return 1.0
-    x, y = b11[use].astype(np.float64), b12[use].astype(np.float64)
-    return float(np.sum(x * y) / max(np.sum(x * x), 1e-20))
+    x = b12[use].astype(np.float64)
+    y = b11[use].astype(np.float64)
+    denominator = float(np.sum(x * x))
+    if denominator <= 0:
+        return 1.0
+    return float(np.sum(y * x) / denominator)
 
 
-def calculate_mbsp(b11, b12, c, valid):
+def calculate_delta_R(b11, b12, c, valid):
+    """ΔR = (c·B12 − B11) / B12."""
     output = np.full(b11.shape, np.nan, dtype=np.float32)
-    use = valid & np.isfinite(b11) & np.isfinite(b12) & (np.abs(b12) > PARAMS["b12_epsilon"])
-    output[use] = c * (b12[use] - b11[use]) / b12[use]
+    use = (
+        valid
+        & np.isfinite(b11) & np.isfinite(b12)
+        & (b11 > 0.05) & (b11 < 0.9)
+        & (b12 > 0.05) & (b12 < 0.9)
+    )
+    output[use] = (c * b12[use] - b11[use]) / b12[use]
     return output
 
 
-def run_algorithm(target, reference):
+def remove_large_scale_background(dOmega, valid_mask, sigma=DETREND_SIGMA):
+    """Normalized Gaussian high-pass filter (paper detrending step)."""
+    finite_valid = valid_mask & np.isfinite(dOmega)
+    d = np.where(finite_valid, dOmega, 0.0).astype(np.float64)
+    w = finite_valid.astype(np.float32)
+    ds = gaussian_filter(d, sigma=sigma)
+    ws = gaussian_filter(w, sigma=sigma)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        background = ds / ws
+    background[ws < 0.1] = 0.0
+    residual = dOmega - background
+    residual[~valid_mask] = np.nan
+    return residual.astype(np.float32), background.astype(np.float32)
+
+
+def normalized_gaussian(data, valid_mask, sigma):
+    finite_valid = valid_mask & np.isfinite(data)
+    d = np.where(finite_valid, data, 0.0).astype(np.float64)
+    w = finite_valid.astype(np.float32)
+    ds = gaussian_filter(d, sigma=sigma)
+    ws = gaussian_filter(w, sigma=sigma)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        output = ds / ws
+    output[ws < 0.1] = np.nan
+    return output.astype(np.float32)
+
+
+def make_spatial_mask(shape, profile, lat=SITE_LAT, lon=SITE_LON, radius_m=SITE_RADIUS_M):
+    """Circular mask centered on the Aradkouh landfill."""
+    transform = profile["transform"]
+    crs = profile["crs"]
+    try:
+        xs, ys = rio_transform("EPSG:4326", crs, [lon], [lat])
+    except Exception:
+        xs, ys = [lon], [lat]
+    row, col = rasterio.transform.rowcol(transform, xs[0], ys[0])
+    row = int(row); col = int(col)
+    h, w = shape
+    if not (0 <= row < h and 0 <= col < w):
+        # site not in tile → return full-true mask
+        return np.ones(shape, dtype=bool), (row, col)
+    rows, cols = np.ogrid[:h, :w]
+    px = abs(transform.a)
+    py = abs(transform.e)
+    dist_m = np.sqrt(((rows - row) * py) ** 2 + ((cols - col) * px) ** 2)
+    return dist_m <= radius_m, (row, col)
+
+
+def run_algorithm(target, reference, profile):
+    """MBMC-faithful plume detection.
+
+    Steps
+    -----
+    1.  LRAD on the target only.
+    2.  Fit c from the target (B12-denominator).
+    3.  ΔR = (c·B12 − B11) / B12 on both scenes.
+    4.  ΔΩ = (ΔR_target − ΔR_ref) / K_MBMP   → ppb
+    5.  Detrend: normalized Gaussian high-pass (σ = 100 px).
+    6.  Gaussian smooth σ = 0.5.
+    7.  Threshold: max(mean + 1σ, 5 ppb).
+    8.  Spatial constraint: 10 km around Aradkouh.
+    9.  Keep only the largest connected component.
+    10. Final dilation & valid-mask clipping.
+    """
+    # 1. LRAD — target only
     target_q = float(np.nanquantile(target["B03"], PARAMS["b03_quantile"]))
-    reference_q = float(np.nanquantile(reference["B03"], PARAMS["b03_quantile"]))
-    valid = calculate_lrad(target, target_q) & calculate_lrad(reference, reference_q)
-    target_mbsp = calculate_mbsp(target["B11"], target["B12"], calculate_c(target["B11"], target["B12"], valid), valid)
-    reference_mbsp = calculate_mbsp(reference["B11"], reference["B12"], calculate_c(reference["B11"], reference["B12"], valid), valid)
-    relative = target_mbsp - reference_mbsp
-    relative[~valid] = np.nan
-    finite = np.isfinite(relative)
-    if not finite.any():
-        raise RuntimeError("LRAD removed all pixels. Reduce artifact thresholds or use a smaller valid AOI.")
+    valid = calculate_lrad(target, target_q)
+    if valid.sum() < 100:
+        raise RuntimeError("LRAD removed nearly all pixels. Relax thresholds or enlarge AOI.")
 
-    values = relative[finite].astype(np.float64)
-    mean_value = float(np.mean(values))
-    std_value = float(np.std(values))
+    # 2. c from target (paper formula)
+    c = calculate_c(target["B11"], target["B12"], valid)
 
-    gaussian = gaussian_filter(np.where(finite, relative, mean_value), sigma=PARAMS["gaussian_sigma"])
-    threshold = mean_value + PARAMS["threshold_sigma"] * std_value
+    # 3. ΔR per scene with shared c
+    dR_t = calculate_delta_R(target["B11"], target["B12"], c, valid)
+    dR_r = calculate_delta_R(reference["B11"], reference["B12"], c, valid)
 
-    initial = valid & np.isfinite(gaussian) & (gaussian > threshold)
-    labels, _ = label(initial, structure=np.ones((3, 3), dtype=np.uint8))
-    sizes = np.bincount(labels.ravel())
-    retained = np.where(sizes >= PARAMS["min_component_pixels"])[0]
-    retained = retained[retained != 0]
+    # 4. ΔΩ in ppb
+    dOmega_t = dR_t / K_MBMP
+    dOmega_r = dR_r / K_MBMP
+    dOmega = dOmega_t - dOmega_r
+    dOmega[~valid] = np.nan
 
-    if len(retained) > 0:
-        keep = set()
-        try:
-            props = regionprops(labels)
-            for prop in props:
-                if prop.label not in retained:
-                    continue
-                if prop.solidity < PARAMS["min_solidity"]:
-                    continue
-                keep.add(prop.label)
-        except Exception:
-            keep = set(retained.tolist())
-        retained = np.array(sorted(keep)) if keep else np.array([], dtype=int)
+    # 5. Detrend (remove large-scale atmospheric / surface gradients)
+    dOmega_detrended, _background = remove_large_scale_background(
+        dOmega, valid, sigma=DETREND_SIGMA
+    )
 
-    connected = np.isin(labels, retained)
+    # 6. Gaussian smoothing
+    d_smooth = normalized_gaussian(dOmega_detrended, valid, GAUSS_SIGMA)
 
-    if connected.any():
-        connected = binary_opening(connected, structure=disk(1))
+    # 7. Threshold
+    vals = d_smooth[np.isfinite(d_smooth)]
+    if vals.size == 0:
+        raise RuntimeError("No finite values after detrending. Try a different reference scene.")
+    mu = float(np.mean(vals))
+    sigma = float(np.std(vals))
+    threshold = max(mu + PARAMS["threshold_sigma"] * sigma, PARAMS["abs_floor_ppb"])
 
-    if connected.any():
-        neighbor_count = convolve(
-            connected.astype(np.uint8),
-            np.ones((3, 3), dtype=np.uint8),
-            mode="constant",
-        )
-        isolated = connected & (neighbor_count <= 1)
-        connected[isolated] = False
+    candidate = np.isfinite(d_smooth) & (d_smooth > threshold) & valid
 
-    final = binary_dilation(connected, structure=disk(PARAMS["final_dilation"])) & valid
+    # 8. Spatial constraint (Aradkouh landfill)
+    spatial_mask, site_rc = make_spatial_mask(dOmega.shape, profile)
+    candidate &= spatial_mask
+
+    # 9. Keep only the largest connected component
+    structure = np.ones((3, 3), dtype=np.uint8)
+    labeled, n_labels = label(candidate, structure=structure)
+    plume = np.zeros_like(candidate, dtype=bool)
+    if n_labels > 0:
+        sizes = np.bincount(labeled.ravel(), minlength=n_labels + 1)
+        sizes[0] = 0
+        sizes = np.where(sizes >= PARAMS["min_component_pixels"], sizes, 0)
+        if sizes.max() > 0:
+            best_label = int(np.argmax(sizes))
+            plume = (labeled == best_label)
+            # sanity: reject implausibly large blobs
+            area_km2 = plume.sum() * (RESOLUTION * RESOLUTION) / 1e6
+            if area_km2 > PARAMS["max_plume_area_km2"]:
+                plume[:] = False
+
+    # 10. Final dilation & clipping
+    if plume.any() and PARAMS["final_dilation"] > 0:
+        plume = binary_dilation(plume, structure=disk(int(PARAMS["final_dilation"])))
+    plume &= valid & spatial_mask
+
     return {
-        "relative": relative,
-        "gaussian": gaussian,
+        "relative": dOmega,
+        "detrended": dOmega_detrended,
+        "gaussian": d_smooth,
         "valid": valid,
-        "initial": initial,
-        "connected": connected,
-        "final": final,
-        "mean": mean_value,
-        "std": std_value,
+        "spatial_mask": spatial_mask,
+        "initial": candidate,
+        "final": plume,
+        "mean": mu,
+        "std": sigma,
         "threshold": threshold,
-        "regions": int(len(retained)),
+        "regions": int(1 if plume.any() else 0),
         "valid_count": int(valid.sum()),
-        "initial_count": int(initial.sum()),
-        "final_count": int(final.sum()),
+        "initial_count": int(candidate.sum()),
+        "final_count": int(plume.sum()),
+        "c": float(c),
+        "site_rc": site_rc,
     }
 
 
@@ -581,7 +702,8 @@ def georeferenced_png_package(array, profile, mask=False):
 def process_single_day(target_scene, reference_scenes, aoi, access_token, store_image=True):
     try:
         target_date = get_datetime(target_scene)
-        target_bands, _ = read_stack(download_scene(target_scene, aoi, access_token))
+        target_path = download_scene(target_scene, aoi, access_token)
+        target_bands, target_profile = read_stack(target_path)
         target_tile = get_tile(target_scene)
         same_tile = [r for r in reference_scenes if get_tile(r) == target_tile]
         candidates = same_tile if same_tile else reference_scenes
@@ -614,7 +736,7 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
                     best_corr = np.nan
         if best_ref_bands is None:
             return None
-        result = run_algorithm(target_bands, best_ref_bands)
+        result = run_algorithm(target_bands, best_ref_bands, target_profile)
         row = {
             "date": target_date,
             "mean_mbmp": float(np.nanmean(result["relative"])),
@@ -625,7 +747,7 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
             "b4_correlation": float(best_corr) if np.isfinite(best_corr) else np.nan,
         }
         if store_image:
-            row["png_relative"] = image_png(result["relative"])
+            row["png_relative"] = image_png(result["detrended"])
             row["png_mask"] = image_png(result["final"], mask=True)
         return row
     except Exception as exc:
@@ -707,7 +829,7 @@ st.markdown("""
 <div class="app-header">
     <div>
         <div class="app-title">🛰️ Sentinel-2 Methane Screening</div>
-        <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; Relative MBMP candidate detection</div>
+        <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC-faithful ΔΩ (ppb) candidate detection</div>
     </div>
     <div class="status-pill">20 m processing &nbsp;•&nbsp; Light dashboard</div>
 </div>
@@ -1000,9 +1122,9 @@ with action_col:
                         )
                         st.stop()
 
-                    progress_status.markdown('<div class="card-caption">Step 4 of 5 · Running relative MBMP anomaly detection and candidate cleanup…</div>', unsafe_allow_html=True)
+                    progress_status.markdown('<div class="card-caption">Step 4 of 5 · Running MBMC ΔΩ (ppb) anomaly detection and candidate cleanup…</div>', unsafe_allow_html=True)
                     progress.progress(78, text="Running methane detection…")
-                    result = run_algorithm(target_bands, best_reference)
+                    result = run_algorithm(target_bands, best_reference, profile)
                     result["b4_correlation"] = best_correlation if np.isfinite(best_correlation) else float("nan")
                     result["date"] = target_date.strftime("%Y-%m-%d")
 
@@ -1013,24 +1135,30 @@ with action_col:
                     output_folder = RESULT_DIR / target_date.strftime("%Y%m%d")
                     output_folder.mkdir(parents=True, exist_ok=True)
                     paths = {}
-                    for key in ("relative", "gaussian", "final", "valid"):
+                    for key in ("relative", "detrended", "gaussian", "final", "valid"):
                         paths[key] = output_folder / f"{key}.tif"
                         save_raster(paths[key], result[key], profile, key in ("final", "valid"))
                     st.session_state.result = result
                     st.session_state.paths = paths
                     st.session_state.output_profile = profile
-                    st.session_state.png_outputs = {"relative": image_png(result["relative"]), "gaussian": image_png(result["gaussian"]), "final": image_png(result["final"], mask=True), "valid": image_png(result["valid"], mask=True)}
+                    st.session_state.png_outputs = {
+                        "relative": image_png(result["relative"]),
+                        "detrended": image_png(result["detrended"]),
+                        "gaussian": image_png(result["gaussian"]),
+                        "final": image_png(result["final"], mask=True),
+                        "valid": image_png(result["valid"], mask=True),
+                    }
                     progress_status.markdown('<div class="card-caption">Step 5 of 5 · Saving georeferenced outputs and preparing downloads…</div>', unsafe_allow_html=True)
                     progress.progress(100, text="Ready to detect · outputs are ready")
                     st.success("Processing completed")
 
-                    if signal_ratio < 0.0005:
+                    if signal_ratio < 0.0001:
                         st.warning(
                             f"⚠️ **Low signal-to-noise ratio detected.** "
                             f"The final candidate mask covers only **{signal_ratio*100:.4f}%** of valid pixels "
                             f"({result['final_count']:,} / {result['valid_count']:,}). "
                             f"This is likely **noise**, not a real methane plume. "
-                            f"Try increasing the threshold multiplier to 4.0–5.0, or pick a "
+                            f"Try increasing the threshold multiplier to 2.0–3.0, or pick a "
                             f"different target/reference date pair."
                         )
                 except Exception as error:
@@ -1058,7 +1186,12 @@ if "result" in st.session_state:
     metrics[3].metric("Final", f"{result['final_count']:,}")
     metrics[4].metric("Regions", result["regions"])
     metrics[5].metric("Threshold", f"{result['threshold']:.5f}")
-    result_items = [("relative", "Relative MBMP", "Anomaly"), ("gaussian", "Gaussian filtered", "Smoothed"), ("final", "Methane candidates", "Final mask"), ("valid", "Valid pixels", "Validity mask")]
+    result_items = [
+        ("relative", "Relative ΔΩ (raw)", "Anomaly"),
+        ("detrended", "ΔΩ after detrend", "Detrended"),
+        ("gaussian", "Gaussian smoothed", "Smoothed"),
+        ("final", "Methane candidates", "Final mask"),
+    ]
     result_cols = st.columns(4, gap="small")
     for col, (key, title, tag) in zip(result_cols, result_items):
         with col:
@@ -1070,7 +1203,7 @@ if "result" in st.session_state:
                 st.image(png_outputs[key], use_container_width=True, output_format="PNG")
             with legend_col:
                 st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
-                st.markdown(legend_html("mask" if key == "final" else "valid" if key == "valid" else "continuous"), unsafe_allow_html=True)
+                st.markdown(legend_html("mask" if key == "final" else "continuous"), unsafe_allow_html=True)
             path = st.session_state.paths[key]
             format_choice = st.selectbox("Download format", ["GeoTIFF (georeferenced)", "PNG + World File (georeferenced)"], key=f"format_choice_{key}")
             if format_choice == "GeoTIFF (georeferenced)":
@@ -1079,20 +1212,33 @@ if "result" in st.session_state:
                 png_package = georeferenced_png_package(result[key], profile, mask=key in ("final", "valid"))
                 st.download_button("⬇ Download Georeferenced PNG package", png_package, file_name=f"{key}_georeferenced_png.zip", mime="application/zip", key=f"download_png_compact_{key}", use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
+
+    # Valid-mask card (kept as before but separate row)
+    st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
+    vc1, vc2 = st.columns([1, 3], gap="small")
+    with vc1:
+        st.markdown('<div class="result-tag">Validity mask</div>', unsafe_allow_html=True)
+        st.image(png_outputs["valid"], use_container_width=True, output_format="PNG")
+    with vc2:
+        st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
+        st.markdown(legend_html("valid"), unsafe_allow_html=True)
+        vpath = st.session_state.paths["valid"]
+        st.download_button("⬇ Download validity mask (GeoTIFF)", vpath.read_bytes(), file_name=vpath.name, mime="image/tiff", key="download_valid_mask", use_container_width=False)
+
     removed_pixels = max(0, int(result["initial_count"]) - int(result["final_count"]))
-    st.markdown(f'<div class="result-note"><b>Candidate cleanup:</b> regions smaller than <b>{int(PARAMS["min_component_pixels"]):,} pixels</b> were excluded. Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · Removed: <b>{removed_pixels:,}</b> · {result["regions"]:,} connected regions.</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="result-note"><b>Candidate cleanup:</b> regions smaller than <b>{int(PARAMS["min_component_pixels"]):,} pixels</b> were excluded, then only the largest region was kept (MBMC paper convention). Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · Removed: <b>{removed_pixels:,}</b> · c = <b>{result["c"]:.4f}</b> · Detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · Floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
     d1, d2 = st.columns([1, 3], gap="small")
     with d1:
         st.download_button("⬇ Reference table CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection.csv", mime="text/csv", key="download_reference_csv_compact", use_container_width=True)
     with d2:
-        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">Relative MBMP anomaly and candidate mask are screening outputs, not physical methane concentration or emission rate.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">ΔΩ (ppb) is a screening quantity following the MBMC framework (Cheng et al., 2026); it is not physical methane concentration or an emission rate.</div>', unsafe_allow_html=True)
 
     # ──────────────────────────────────────────────────────────────────
     # 05a · 30-DAY TIME SERIES
     # ──────────────────────────────────────────────────────────────────
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05a · 30-DAY TIME SERIES & VISUAL PLAYBACK</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">Track daily changes of relative MBMP over the 30-day window. Use the slider below the chart to visually scrub through each day.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">Track daily changes of relative ΔΩ (ppb) over the 30-day window. Use the slider below the chart to visually scrub through each day.</div>', unsafe_allow_html=True)
 
     ts_col1, ts_col2 = st.columns([1, 3], gap="small")
     with ts_col1:
@@ -1163,7 +1309,7 @@ if "result" in st.session_state:
         if not ts.empty and "mean_mbmp" in ts.columns:
             chart_df = ts.dropna(subset=["mean_mbmp"]).set_index("date")[["mean_mbmp", "max_mbmp"]]
             if not chart_df.empty:
-                st.markdown('<div class="card-caption">Daily relative MBMP statistics in the AOI</div>', unsafe_allow_html=True)
+                st.markdown('<div class="card-caption">Daily ΔΩ (ppb) statistics in the AOI</div>', unsafe_allow_html=True)
                 st.line_chart(chart_df, use_container_width=True, height=240)
                 st.dataframe(
                     ts,
@@ -1172,9 +1318,9 @@ if "result" in st.session_state:
                     height=180,
                     column_config={
                         "date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
-                        "mean_mbmp": st.column_config.NumberColumn("Mean MBMP", format="%.5f"),
-                        "max_mbmp": st.column_config.NumberColumn("Max MBMP", format="%.5f"),
-                        "std_mbmp": st.column_config.NumberColumn("Std MBMP", format="%.5f"),
+                        "mean_mbmp": st.column_config.NumberColumn("Mean ΔΩ (ppb)", format="%.2f"),
+                        "max_mbmp": st.column_config.NumberColumn("Max ΔΩ (ppb)", format="%.2f"),
+                        "std_mbmp": st.column_config.NumberColumn("Std ΔΩ (ppb)", format="%.2f"),
                         "b4_correlation": st.column_config.NumberColumn("B4 corr", format="%.3f"),
                     },
                 )
@@ -1204,14 +1350,14 @@ if "result" in st.session_state:
                 frame = visuals[selected_day]
                 v1, v2 = st.columns(2, gap="small")
                 with v1:
-                    st.markdown(f'<div class="card-caption" style="font-weight:700;">{selected_day} · Relative MBMP</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="card-caption" style="font-weight:700;">{selected_day} · ΔΩ detrended</div>', unsafe_allow_html=True)
                     st.image(frame["png_relative"], use_container_width=True, output_format="PNG")
                 with v2:
                     st.markdown(f'<div class="card-caption" style="font-weight:700;">{selected_day} · Candidate mask</div>', unsafe_allow_html=True)
                     st.image(frame["png_mask"], use_container_width=True, output_format="PNG")
                 m1, m2, m3 = st.columns(3, gap="small")
-                m1.metric("Mean MBMP", f"{frame['mean_mbmp']:.5f}")
-                m2.metric("Max MBMP", f"{frame['max_mbmp']:.5f}")
+                m1.metric("Mean ΔΩ (ppb)", f"{frame['mean_mbmp']:.2f}")
+                m2.metric("Max ΔΩ (ppb)", f"{frame['max_mbmp']:.2f}")
                 m3.metric("Candidate pixels", f"{frame['final_pixels']:,}")
 
     # ──────────────────────────────────────────────────────────────────
@@ -1242,7 +1388,6 @@ if "result" in st.session_state:
                 )
             with rasterio.open(s5p_path) as src:
                 ch4 = src.read(1).astype(np.float32)
-            # Keep all finite pixels (do NOT filter by qa)
             ch4[~np.isfinite(ch4)] = np.nan
             ch4[ch4 <= 0] = np.nan
             st.session_state.s5p_ch4 = ch4
@@ -1254,7 +1399,6 @@ if "result" in st.session_state:
         ch4 = st.session_state.s5p_ch4
         valid_ch4 = ch4[np.isfinite(ch4)]
 
-        # ── Fallback: fill with placeholder if no valid pixels ──────
         if valid_ch4.size < 2:
             placeholder = float(np.nanmean(valid_ch4)) if valid_ch4.size > 0 else 1900.0
             ch4 = np.full_like(ch4, placeholder)
