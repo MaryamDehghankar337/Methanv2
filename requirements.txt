@@ -1,0 +1,12 @@
+streamlit
+folium
+streamlit-folium
+numpy
+pandas
+requests
+rasterio
+scipy
+shapely
+scikit-image
+Pillow
+matplotlib
