@@ -1,8 +1,15 @@
-"""Sentinel-2 methane screening — multi-reference median version.
+"""Sentinel-2 methane screening — signal-preserving version.
 
-KEY CHANGE: Instead of comparing to ONE reference, this builds a MEDIAN
-reference from the top-K best-correlated scenes (using B11+B12 correlation),
-then applies a strict spatial-coherence filter.
+CRITICAL FIX: Previous version killed real signal via overly-aggressive
+filters (binary_opening disk(2), min_pixels=40, solidity=0.55).
+This version:
+  • Removes binary_opening entirely
+  • Reduces spatial_coherence_min from 7 → 4
+  • Reduces min_component_pixels from 40 → 10
+  • Reduces min_solidity from 0.55 → 0.15
+  • Adds UI sliders for all critical filter params
+  • Shows INITIAL and COHERENT masks as separate views
+  • Multi-reference median + SWIR correlation
 """
 from __future__ import annotations
 
@@ -25,7 +32,6 @@ import streamlit as st
 from folium.plugins import Draw
 from scipy.ndimage import (
     binary_dilation,
-    binary_opening,
     gaussian_filter,
     label,
     convolve,
@@ -57,14 +63,14 @@ PARAMS = {
     "ndbi_threshold": 0.20,
     "ndsi_threshold": 0.42,
     "lrad_dilation": 2,
-    # ── Multi-reference + spatial coherence ──────────────────────────
-    "n_reference_scenes": 6,       # use median of top-6 best scenes
-    "gaussian_sigma": 2.0,         # stronger smoothing
-    "threshold_sigma": 2.5,
-    "spatial_coherence_min": 7,    # require 7 of 8 neighbors above threshold
-    "min_component_pixels": 40,
+    "n_reference_scenes": 6,
+    "gaussian_sigma": 1.5,
+    "threshold_sigma": 2.0,
+    # ── MUCH LESS AGGRESSIVE ─────────────────────────────────────────
+    "spatial_coherence_min": 4,     # 4 of 8 neighbors (was 7)
+    "min_component_pixels": 10,      # was 40
     "final_dilation": 2,
-    "min_solidity": 0.55,
+    "min_solidity": 0.15,            # was 0.55
     "b12_epsilon": 1e-6,
     "min_valid_ref_pixels": 100,
 }
@@ -166,12 +172,7 @@ def authenticate_cdse(username: str, password: str, totp: str = ""):
     totp = totp.strip()
     if not username or not password:
         raise RuntimeError("Please enter your Copernicus email and password.")
-    form = {
-        "grant_type": "password",
-        "client_id": "cdse-public",
-        "username": username,
-        "password": password,
-    }
+    form = {"grant_type": "password", "client_id": "cdse-public", "username": username, "password": password}
     if totp:
         form["totp"] = totp
     response = requests.post(TOKEN_URL, data=form, timeout=90)
@@ -200,11 +201,7 @@ def refresh_cdse_session(auth):
         return None
     response = requests.post(
         TOKEN_URL,
-        data={
-            "grant_type": "refresh_token",
-            "client_id": "cdse-public",
-            "refresh_token": refresh_token,
-        },
+        data={"grant_type": "refresh_token", "client_id": "cdse-public", "refresh_token": refresh_token},
         timeout=90,
     )
     if response.status_code >= 400:
@@ -300,9 +297,7 @@ def download_scene(item, aoi, access_token):
 
 def download_s5p_scene(aoi, date_from, date_to, access_token):
     aoi = ensure_aoi(aoi)
-    cache_id = hashlib.sha256(
-        json.dumps(["s5p_v4", aoi, str(date_from), str(date_to)], sort_keys=True).encode()
-    ).hexdigest()[:24]
+    cache_id = hashlib.sha256(json.dumps(["s5p_v5", aoi, str(date_from), str(date_to)], sort_keys=True).encode()).hexdigest()[:24]
     folder = CACHE_DIR / f"s5p_{cache_id}"
     output_path = folder / "ch4.tif"
     if output_path.exists():
@@ -311,33 +306,13 @@ def download_s5p_scene(aoi, date_from, date_to, access_token):
     minx, miny, maxx, maxy = shape(aoi).bounds
     payload = {
         "input": {
-            "bounds": {
-                "bbox": [minx, miny, maxx, maxy],
-                "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"},
-            },
-            "data": [{
-                "type": S5P_COLLECTION,
-                "dataFilter": {
-                    "timeRange": {
-                        "from": date_from.strftime("%Y-%m-%dT00:00:00Z"),
-                        "to": date_to.strftime("%Y-%m-%dT23:59:59Z"),
-                    },
-                },
-            }],
+            "bounds": {"bbox": [minx, miny, maxx, maxy], "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}},
+            "data": [{"type": S5P_COLLECTION, "dataFilter": {"timeRange": {"from": date_from.strftime("%Y-%m-%dT00:00:00Z"), "to": date_to.strftime("%Y-%m-%dT23:59:59Z")}}}],
         },
-        "output": {
-            "width": 256,
-            "height": 256,
-            "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}],
-        },
+        "output": {"width": 256, "height": 256, "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}]},
         "evalscript": s5p_evalscript(),
     }
-    response = requests.post(
-        PROCESS_URL,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=300,
-    )
+    response = requests.post(PROCESS_URL, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, json=payload, timeout=300)
     if response.status_code >= 400:
         try:
             detail = response.json()
@@ -392,13 +367,7 @@ def calculate_mbsp(b11, b12, c, valid):
 
 
 def run_algorithm_multi(target, reference_median, valid_lrad):
-    """
-    Run MBMP using a MEDIAN reference (dict with B11, B12).
-    Applies spatial-coherence filter to kill scattered noise.
-    """
-    # Compute C from target only
     c_target = calculate_c(target["B11"], target["B12"], valid_lrad)
-
     target_mbsp = calculate_mbsp(target["B11"], target["B12"], c_target, valid_lrad)
     reference_mbsp = calculate_mbsp(reference_median["B11"], reference_median["B12"], c_target, valid_lrad)
 
@@ -406,30 +375,28 @@ def run_algorithm_multi(target, reference_median, valid_lrad):
     relative[~valid_lrad] = np.nan
     finite = np.isfinite(relative)
     if not finite.any():
-        raise RuntimeError("LRAD removed all pixels. Reduce artifact thresholds or use a smaller valid AOI.")
+        raise RuntimeError("LRAD removed all pixels.")
 
     values = relative[finite].astype(np.float64)
     mean_value = float(np.mean(values))
     std_value = float(np.std(values))
 
-    # Strong gaussian smoothing
     gaussian = gaussian_filter(np.where(finite, relative, mean_value), sigma=PARAMS["gaussian_sigma"])
     threshold = mean_value + PARAMS["threshold_sigma"] * std_value
 
-    # Initial: pixel above threshold
+    # Stage 1: pixel above threshold
     above = valid_lrad & np.isfinite(gaussian) & (gaussian > threshold)
 
-    # ── SPATIAL COHERENCE FILTER ─────────────────────────────────────
-    # Require at least N of 8 neighbors to also be above threshold
+    # Stage 2: spatial coherence (require N of 8 neighbors also above)
     neighbor_count = convolve(
         above.astype(np.float32),
         np.ones((3, 3), dtype=np.float32),
         mode="constant",
-    ) - above.astype(np.float32)  # exclude self
+    ) - above.astype(np.float32)
 
     coherent = above & (neighbor_count >= PARAMS["spatial_coherence_min"])
 
-    # Connected-component + solidity filter
+    # Stage 3: connected components with size + solidity filter
     labels, _ = label(coherent, structure=np.ones((3, 3), dtype=np.uint8))
     sizes = np.bincount(labels.ravel())
     retained = np.where(sizes >= PARAMS["min_component_pixels"])[0]
@@ -451,11 +418,8 @@ def run_algorithm_multi(target, reference_median, valid_lrad):
 
     connected = np.isin(labels, retained)
 
-    # Morphological opening with disk(2) → kills thin lines
-    if connected.any():
-        connected = binary_opening(connected, structure=disk(2))
-
-    # Final dilation
+    # NOTE: NO binary_opening here — it kills small real plumes.
+    # Final dilation only.
     final = binary_dilation(connected, structure=disk(PARAMS["final_dilation"])) & valid_lrad
 
     return {
@@ -541,11 +505,11 @@ def ch4_anomaly_png(array):
 
 def legend_html(kind):
     if kind == "mask":
-        rows = [("#dc1e1e", "Methane candidate"), ("#000000", "Background / non-candidate")]
+        rows = [("#dc1e1e", "Candidate"), ("#000000", "Background")]
     elif kind == "valid":
-        rows = [("#dc1e1e", "Valid pixels"), ("#000000", "Invalid / masked pixels")]
+        rows = [("#dc1e1e", "Valid"), ("#000000", "Invalid")]
     elif kind == "s5p":
-        rows = [("#b43232", "CH4 above local mean"), ("#3250b4", "CH4 below local mean"), ("#ffffff", "No data")]
+        rows = [("#b43232", "Above local mean"), ("#3250b4", "Below local mean"), ("#ffffff", "No data")]
     else:
         rows = [("#b43232", "Higher anomaly"), ("#3250b4", "Lower anomaly"), ("#ffffff", "No data")]
     items = "".join(f'<div class="legend-row"><span class="legend-swatch" style="background:{c};"></span><span>{t}</span></div>' for c, t in rows)
@@ -585,17 +549,8 @@ st.set_page_config(page_title="Sentinel-2 Methane", page_icon="🛰️", layout=
 
 st.markdown("""
 <style>
-:root {
-    --red: #e63946;
-    --honeydew: #f1faee;
-    --frost: #a8dadc;
-    --blue: #457b9d;
-    --navy: #1d3557;
-    --black: #111111;
-    --white: #ffffff;
-    --border: #d8e6e8;
-    --dark-field: #292a33;
-}
+:root { --honeydew:#f1faee; --frost:#a8dadc; --blue:#457b9d; --navy:#1d3557;
+        --black:#111111; --border:#d8e6e8; --dark-field:#292a33; }
 .stApp { background: #f1faee; color: #111111 !important; }
 [data-testid="stHeader"] { background: #f1faee !important; height: 3.25rem !important; }
 [data-testid="stSidebar"] { display: none; }
@@ -609,7 +564,11 @@ st.markdown("""
 .card-caption { color: #111111 !important; font-size: 0.73rem; margin-bottom: 0.45rem; }
 .section-label { display: inline-block; background: #a8dadc; color: #111111 !important; border-radius: 999px; padding: 0.2rem 0.55rem; font-size: 0.65rem; font-weight: 800; margin-bottom: 0.35rem; }
 .stApp p, .stApp label, .stApp small, .stApp strong, .stApp li, .stApp td, .stApp th { color: #111111 !important; }
-div[data-testid="stDateInput"] input, .stDateInput input, div[data-testid="stNumberInput"] input, .stNumberInput input { background-color: var(--dark-field) !important; color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; }
+div[data-testid="stDateInput"] input, .stDateInput input,
+div[data-testid="stNumberInput"] input, .stNumberInput input {
+    background-color: var(--dark-field) !important; color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+}
 input::placeholder, textarea::placeholder { color: #bfc3cc !important; }
 div[data-baseweb="popover"] [role="listbox"], div[data-baseweb="popover"] [role="option"] { background: #111318 !important; }
 div[data-baseweb="popover"] [role="listbox"] *, div[data-baseweb="popover"] [role="option"] * { color: #ffffff !important; }
@@ -617,9 +576,8 @@ div[data-baseweb="popover"] [role="listbox"] *, div[data-baseweb="popover"] [rol
 .stButton > button[kind="primary"] { background: #e63946; border-color: #e63946; color: #ffffff !important; }
 .stButton > button[kind="primary"] * { color: #ffffff !important; }
 .stDownloadButton > button { background: #ffffff; color: #111111 !important; border: 1px solid #a8dadc; }
-.auth-card { background: #f8fbfb; border: 1px solid #d7e4e7; border-radius: 11px; padding: 0.65rem 0.75rem; margin-top: 0.45rem; }
+.auth-card { background: #f8fbfb; border: 1px solid #d7e4e7; border-radius: 11px; padding: 0.65rem 0.75rem; }
 .auth-status { background: #e8f7ea; border: 1px solid #9ed2a4; color: #155724 !important; border-radius: 9px; padding: 0.45rem 0.6rem; font-size: 0.76rem; font-weight: 700; margin-bottom: 0.45rem; }
-.auth-help { color: #111111 !important; font-size: 0.72rem; margin: 0.2rem 0 0.45rem 0; }
 .result-legend { background: #ffffff; border: 1px solid #d7e4e7; border-radius: 10px; padding: 0.75rem 0.7rem; min-height: 96px; display: flex; flex-direction: column; justify-content: center; gap: 0.42rem; }
 .result-legend .legend-heading { color: #111111 !important; font-size: 0.88rem; font-weight: 800; }
 .result-legend .legend-row { display: flex; align-items: center; gap: 0.45rem; color: #111111 !important; font-size: 0.82rem; }
@@ -632,7 +590,7 @@ st.markdown("""
 <div class="app-header">
     <div>
         <div class="app-title">🛰️ Sentinel-2 Methane Screening</div>
-        <div class="app-subtitle">Multi-reference median + spatial coherence detection</div>
+        <div class="app-subtitle">Multi-reference median + tunable spatial filter</div>
     </div>
     <div class="status-pill">20 m processing</div>
 </div>
@@ -646,7 +604,6 @@ with map_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">01 · STUDY AREA</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-title">Area of Interest</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">Draw or edit the study area directly on the map.</div>', unsafe_allow_html=True)
     map_data = st_folium(create_map(st.session_state.aoi), height=385, width=1000, key="aoi_map")
     if map_data and map_data.get("all_drawings"):
         new_aoi = normalize_geometry({"type": "FeatureCollection", "features": map_data["all_drawings"]})
@@ -673,74 +630,75 @@ with control_col:
 
     if st.button("🔎  Search Sentinel-2 scenes", type="primary", use_container_width=True):
         try:
-            with st.spinner("Searching CDSE STAC..."):
-                search_results = search_scenes(
-                    st.session_state.aoi,
-                    datetime.combine(start_date, datetime.min.time()),
-                    datetime.combine(end_date, datetime.max.time()),
-                    max_cloud,
-                )
-            if search_results is None:
-                search_results = []
-            elif not isinstance(search_results, list):
-                search_results = list(search_results)
-            st.session_state["scene_results"] = search_results
+            with st.spinner("Searching…"):
+                sr = search_scenes(st.session_state.aoi,
+                                   datetime.combine(start_date, datetime.min.time()),
+                                   datetime.combine(end_date, datetime.max.time()),
+                                   max_cloud)
+            if sr is None:
+                sr = []
+            elif not isinstance(sr, list):
+                sr = list(sr)
+            st.session_state["scene_results"] = sr
             st.session_state.pop("target", None)
-            if search_results:
-                st.success(f"{len(search_results)} scene(s) found")
-            else:
-                st.warning("No Sentinel-2 scenes were found for the selected criteria.")
-        except Exception as error:
+            st.success(f"{len(sr)} scene(s)") if sr else st.warning("No scenes found.")
+        except Exception as e:
             st.session_state["scene_results"] = []
-            st.session_state.pop("target", None)
-            st.error(f"Scene search failed: {error}")
+            st.error(f"Search failed: {e}")
 
     scene_results = st.session_state.get("scene_results", [])
 
     if scene_results:
-        scene_table = pd.DataFrame([
-            {"date": get_datetime(scene), "tile": get_tile(scene), "cloud": get_cloud(scene)}
-            for scene in scene_results
-        ]).sort_values(["date", "cloud"], ascending=[True, True], na_position="last")
+        scene_table = pd.DataFrame([{"date": get_datetime(s), "tile": get_tile(s), "cloud": get_cloud(s)} for s in scene_results]).sort_values(["date", "cloud"], ascending=[True, True], na_position="last")
+        st.dataframe(scene_table, use_container_width=True, height=112, hide_index=True,
+                     column_config={"date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
+                                    "cloud": st.column_config.NumberColumn("Cloud %", format="%.1f")})
+        scene_ids = [as_dict(s).get("id") for s in scene_results if as_dict(s).get("id")]
 
-        st.dataframe(
-            scene_table, use_container_width=True, height=112, hide_index=True,
-            column_config={
-                "date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
-                "cloud": st.column_config.NumberColumn("Cloud %", format="%.1f"),
-            },
-        )
-
-        scene_ids = [as_dict(scene).get("id") for scene in scene_results if as_dict(scene).get("id")]
-
-        def format_scene(scene_id):
-            scene = next((c for c in scene_results if as_dict(c).get("id") == scene_id), None)
-            if scene is None:
-                return str(scene_id)
-            sd = get_datetime(scene)
-            dt = sd.strftime("%Y-%m-%d") if sd else "Unknown"
-            return f"{dt}  |  {get_tile(scene) or 'Unknown tile'}  |  cloud {get_cloud(scene):.1f}%"
+        def fmt(sid):
+            s = next((c for c in scene_results if as_dict(c).get("id") == sid), None)
+            if s is None:
+                return str(sid)
+            sd = get_datetime(s)
+            dt = sd.strftime("%Y-%m-%d") if sd else "?"
+            return f"{dt} | {get_tile(s) or '?'} | cloud {get_cloud(s):.1f}%"
 
         if scene_ids:
-            selected_scene_id = st.selectbox("Target scene", scene_ids, format_func=format_scene, key="target_scene_select")
-            selected_scene = next((s for s in scene_results if as_dict(s).get("id") == selected_scene_id), None)
-            if selected_scene is not None:
-                st.session_state["target"] = selected_scene
+            sel = st.selectbox("Target scene", scene_ids, format_func=fmt, key="target_scene_select")
+            chosen = next((s for s in scene_results if as_dict(s).get("id") == sel), None)
+            if chosen is not None:
+                st.session_state["target"] = chosen
     st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
 settings_col, action_col = st.columns([1.65, 1.0], gap="small")
+
 with settings_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">03 · DETECTION</div>', unsafe_allow_html=True)
-    p1, p2, p3 = st.columns(3, gap="small")
-    with p1:
-        PARAMS["threshold_sigma"] = st.number_input("Threshold multiplier", min_value=0.1, max_value=6.0, value=float(PARAMS["threshold_sigma"]), step=0.1, key="threshold_sigma")
-    with p2:
-        PARAMS["min_component_pixels"] = st.number_input("Minimum candidate pixels", min_value=2, max_value=1000, value=int(PARAMS["min_component_pixels"]), step=5, key="min_component_pixels")
-    with p3:
-        PARAMS["n_reference_scenes"] = st.number_input("Reference scenes (median)", min_value=2, max_value=20, value=int(PARAMS["n_reference_scenes"]), step=1, key="n_refs")
-    st.markdown(f'<div class="card-caption">Median of top-{PARAMS["n_reference_scenes"]} scenes by SWIR correlation · spatial coherence: ≥{PARAMS["spatial_coherence_min"]}/8 neighbors.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">03 · DETECTION PARAMETERS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption" style="font-weight:700;">Signal detection</div>', unsafe_allow_html=True)
+    a1, a2, a3 = st.columns(3, gap="small")
+    with a1:
+        PARAMS["threshold_sigma"] = st.number_input("Threshold (σ)", min_value=0.5, max_value=6.0,
+                                                     value=float(PARAMS["threshold_sigma"]), step=0.1, key="thr_sigma")
+    with a2:
+        PARAMS["gaussian_sigma"] = st.number_input("Gaussian σ", min_value=0.5, max_value=4.0,
+                                                    value=float(PARAMS["gaussian_sigma"]), step=0.1, key="g_sigma")
+    with a3:
+        PARAMS["n_reference_scenes"] = st.number_input("Reference count", min_value=2, max_value=20,
+                                                        value=int(PARAMS["n_reference_scenes"]), step=1, key="n_refs")
+    st.markdown('<div class="card-caption" style="font-weight:700;margin-top:0.4rem;">Noise filtering (lower = keep more)</div>', unsafe_allow_html=True)
+    b1, b2, b3 = st.columns(3, gap="small")
+    with b1:
+        PARAMS["spatial_coherence_min"] = st.number_input("Coherence (of 8)", min_value=0, max_value=8,
+                                                           value=int(PARAMS["spatial_coherence_min"]), step=1, key="coh_min")
+    with b2:
+        PARAMS["min_component_pixels"] = st.number_input("Min pixels/region", min_value=1, max_value=500,
+                                                          value=int(PARAMS["min_component_pixels"]), step=1, key="min_px")
+    with b3:
+        PARAMS["min_solidity"] = st.number_input("Min solidity", min_value=0.0, max_value=1.0,
+                                                  value=float(PARAMS["min_solidity"]), step=0.05, key="min_sol")
+    st.markdown(f'<div class="card-caption">Pipeline: threshold (σ) → coherence filter (≥{PARAMS["spatial_coherence_min"]}/8) → size filter (≥{PARAMS["min_component_pixels"]}px) → solidity (≥{PARAMS["min_solidity"]:.2f}).</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with action_col:
@@ -749,23 +707,23 @@ with action_col:
     scene_results = st.session_state.get("scene_results", [])
     cdse_auth = st.session_state.get("cdse_auth")
     if cdse_auth:
-        st.markdown(f'<div class="auth-status">✓ Copernicus connected · {cdse_auth.get("username", "")}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="auth-status">✓ Connected · {cdse_auth.get("username", "")}</div>', unsafe_allow_html=True)
         if st.button("Log out", use_container_width=True, key="cdse_logout"):
             st.session_state.pop("cdse_auth", None)
             st.rerun()
     else:
         st.markdown('<div class="auth-card">', unsafe_allow_html=True)
         st.markdown('<div class="card-title">Copernicus login</div>', unsafe_allow_html=True)
-        st.link_button("🌐 Open Copernicus website", "https://dataspace.copernicus.eu/", use_container_width=True)
+        st.link_button("🌐 Open Copernicus", "https://dataspace.copernicus.eu/", use_container_width=True)
         with st.form("cdse_login_form", clear_on_submit=True):
-            login_user = st.text_input("Copernicus email", placeholder="your-email@example.com")
-            login_password = st.text_input("Copernicus password", type="password")
-            login_totp = st.text_input("2FA code (optional)", max_chars=8)
-            login_submitted = st.form_submit_button("🔐 Login & connect", type="primary", use_container_width=True)
-        if login_submitted:
+            u = st.text_input("Email", placeholder="your-email@example.com")
+            p = st.text_input("Password", type="password")
+            t = st.text_input("2FA (optional)", max_chars=8)
+            sub = st.form_submit_button("🔐 Login", type="primary", use_container_width=True)
+        if sub:
             try:
                 with st.spinner("Connecting…"):
-                    st.session_state.cdse_auth = authenticate_cdse(login_user, login_password, login_totp)
+                    st.session_state.cdse_auth = authenticate_cdse(u, p, t)
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
@@ -774,61 +732,56 @@ with action_col:
     if scene_results and "target" in st.session_state:
         target = st.session_state.get("target")
         if target is not None:
-            target_date = get_datetime(target)
-            target_tile = get_tile(target) or "Unknown"
-            target_label = target_date.strftime("%Y-%m-%d") if target_date else "Unknown"
-            st.markdown(f'<div class="card-title">Ready to detect</div><div class="card-caption">Target: {target_label} · {target_tile}</div>', unsafe_allow_html=True)
-            detect_clicked = st.button("🛰️  Download AOI & Detect", type="primary", use_container_width=True, key="detect_button", disabled=not bool(st.session_state.get("cdse_auth")))
-            if detect_clicked:
+            tdate = get_datetime(target)
+            ttile = get_tile(target) or "?"
+            tlabel = tdate.strftime("%Y-%m-%d") if tdate else "?"
+            st.markdown(f'<div class="card-title">Ready</div><div class="card-caption">Target: {tlabel} · {ttile}</div>', unsafe_allow_html=True)
+            clicked = st.button("🛰️  Download & Detect", type="primary", use_container_width=True, key="detect_button",
+                                 disabled=not bool(st.session_state.get("cdse_auth")))
+            if clicked:
                 progress = st.progress(0, text="Preparing…")
                 status = st.empty()
                 try:
-                    status.markdown('<div class="card-caption">Step 1/5 · Auth + target setup…</div>', unsafe_allow_html=True)
+                    status.markdown('<div class="card-caption">Step 1/5 · Auth…</div>', unsafe_allow_html=True)
                     progress.progress(5)
                     access_token = get_access_token()
                     target = st.session_state["target"]
-                    target_date = get_datetime(target)
-                    target_tile = get_tile(target)
-                    if target_date is None:
-                        raise RuntimeError("Target has no valid date.")
-
-                    candidates = [
-                        s for s in scene_results
-                        if as_dict(s).get("id") != as_dict(target).get("id")
-                        and get_datetime(s) is not None
-                        and abs((get_datetime(s) - target_date).total_seconds()) / 86400 <= reference_days
-                    ]
-                    same_tile = [s for s in candidates if get_tile(s) == target_tile]
+                    tdate = get_datetime(target)
+                    ttile = get_tile(target)
+                    if tdate is None:
+                        raise RuntimeError("No valid date.")
+                    candidates = [s for s in scene_results
+                                  if as_dict(s).get("id") != as_dict(target).get("id")
+                                  and get_datetime(s) is not None
+                                  and abs((get_datetime(s) - tdate).total_seconds()) / 86400 <= reference_days]
+                    same_tile = [s for s in candidates if get_tile(s) == ttile]
                     references = same_tile if same_tile else candidates
                     if not references:
-                        st.warning("No reference scenes. Widen the date range.")
+                        st.warning("No references.")
                         st.stop()
 
-                    status.markdown('<div class="card-caption">Step 2/5 · Downloading target bands…</div>', unsafe_allow_html=True)
+                    status.markdown('<div class="card-caption">Step 2/5 · Target…</div>', unsafe_allow_html=True)
                     progress.progress(15)
                     target_bands, profile = read_stack(download_scene(target, st.session_state.aoi, access_token))
-                    target_q = float(np.nanquantile(target_bands["B03"], PARAMS["b03_quantile"]))
-                    target_lrad = calculate_lrad(target_bands, target_q)
+                    tq = float(np.nanquantile(target_bands["B03"], PARAMS["b03_quantile"]))
+                    target_lrad = calculate_lrad(target_bands, tq)
 
-                    # ── Download ALL references, score by B11+B12 correlation
-                    status.markdown(f'<div class="card-caption">Step 3/5 · Downloading {len(references)} reference scenes…</div>', unsafe_allow_html=True)
+                    status.markdown(f'<div class="card-caption">Step 3/5 · {len(references)} references…</div>', unsafe_allow_html=True)
                     ref_rows = []
                     ref_bands_list = []
-                    total_refs = max(1, len(references))
-
+                    tot = max(1, len(references))
                     for i, ref in enumerate(references, start=1):
-                        pct = 20 + int(45 * i / total_refs)
-                        progress.progress(pct, text=f"Reference {i}/{total_refs}…")
+                        progress.progress(20 + int(45 * i / tot), text=f"Ref {i}/{tot}…")
                         try:
                             rb, _ = read_stack(download_scene(ref, st.session_state.aoi, access_token))
                         except Exception:
                             continue
-                        valid_px = target_lrad & np.isfinite(rb["B11"]) & np.isfinite(rb["B12"]) & np.isfinite(target_bands["B11"]) & np.isfinite(target_bands["B12"])
-                        vc = int(valid_px.sum())
+                        vpx = target_lrad & np.isfinite(rb["B11"]) & np.isfinite(rb["B12"]) & np.isfinite(target_bands["B11"]) & np.isfinite(target_bands["B12"])
+                        vc = int(vpx.sum())
                         corr = np.nan
                         if vc >= PARAMS["min_valid_ref_pixels"]:
-                            t11 = target_bands["B11"][valid_px]; r11 = rb["B11"][valid_px]
-                            t12 = target_bands["B12"][valid_px]; r12 = rb["B12"][valid_px]
+                            t11 = target_bands["B11"][vpx]; r11 = rb["B11"][vpx]
+                            t12 = target_bands["B12"][vpx]; r12 = rb["B12"][vpx]
                             if np.std(r11) > 1e-9 and np.std(r12) > 1e-9:
                                 try:
                                     c11 = float(np.corrcoef(t11, r11)[0, 1])
@@ -836,86 +789,88 @@ with action_col:
                                     corr = (c11 + c12) / 2.0
                                 except Exception:
                                     pass
-                        ref_rows.append({
-                            "id": as_dict(ref).get("id"), "date": get_datetime(ref),
-                            "tile": get_tile(ref), "swir_correlation": corr, "valid_pixels": vc,
-                        })
+                        ref_rows.append({"id": as_dict(ref).get("id"), "date": get_datetime(ref), "tile": get_tile(ref),
+                                         "swir_correlation": corr, "valid_pixels": vc})
                         if np.isfinite(corr):
                             ref_bands_list.append((corr, rb))
 
                     st.session_state.reference_table = pd.DataFrame(ref_rows)
 
                     if not ref_bands_list:
-                        st.error("No usable reference scene (SWIR correlation could not be computed).")
+                        st.error("No usable references (SWIR correlation failed).")
                         st.stop()
 
-                    # ── Sort by correlation, take top-K, build median stack
                     ref_bands_list.sort(key=lambda x: -x[0])
                     top_k = ref_bands_list[:PARAMS["n_reference_scenes"]]
-                    status.markdown(f'<div class="card-caption">Step 4/5 · Building median reference from top-{len(top_k)} scenes…</div>', unsafe_allow_html=True)
+                    status.markdown(f'<div class="card-caption">Step 4/5 · Median of top-{len(top_k)}…</div>', unsafe_allow_html=True)
                     progress.progress(75)
 
-                    b11_stack = np.stack([rb["B11"] for _, rb in top_k], axis=0)
-                    b12_stack = np.stack([rb["B12"] for _, rb in top_k], axis=0)
-                    b03_stack = np.stack([rb["B03"] for _, rb in top_k], axis=0)
-                    b04_stack = np.stack([rb["B04"] for _, rb in top_k], axis=0)
-                    b08_stack = np.stack([rb["B08"] for _, rb in top_k], axis=0)
+                    b11s = np.stack([rb["B11"] for _, rb in top_k], axis=0)
+                    b12s = np.stack([rb["B12"] for _, rb in top_k], axis=0)
+                    b03s = np.stack([rb["B03"] for _, rb in top_k], axis=0)
+                    b04s = np.stack([rb["B04"] for _, rb in top_k], axis=0)
+                    b08s = np.stack([rb["B08"] for _, rb in top_k], axis=0)
 
                     median_ref = {
-                        "B11": np.nanmedian(b11_stack, axis=0).astype(np.float32),
-                        "B12": np.nanmedian(b12_stack, axis=0).astype(np.float32),
-                        "B03": np.nanmedian(b03_stack, axis=0).astype(np.float32),
-                        "B04": np.nanmedian(b04_stack, axis=0).astype(np.float32),
-                        "B08": np.nanmedian(b08_stack, axis=0).astype(np.float32),
+                        "B11": np.nanmedian(b11s, axis=0).astype(np.float32),
+                        "B12": np.nanmedian(b12s, axis=0).astype(np.float32),
+                        "B03": np.nanmedian(b03s, axis=0).astype(np.float32),
+                        "B04": np.nanmedian(b04s, axis=0).astype(np.float32),
+                        "B08": np.nanmedian(b08s, axis=0).astype(np.float32),
                     }
 
-                    # Common LRAD: target AND median reference
-                    ref_q = float(np.nanquantile(median_ref["B03"], PARAMS["b03_quantile"]))
-                    ref_lrad = calculate_lrad(median_ref, ref_q)
+                    rq = float(np.nanquantile(median_ref["B03"], PARAMS["b03_quantile"]))
+                    ref_lrad = calculate_lrad(median_ref, rq)
                     valid_lrad = target_lrad & ref_lrad
 
                     if valid_lrad.sum() < 1000:
-                        st.warning(f"Only {int(valid_lrad.sum()):,} valid pixels after LRAD. Consider a larger AOI.")
+                        st.warning(f"Only {int(valid_lrad.sum()):,} valid pixels.")
                         st.stop()
 
-                    status.markdown('<div class="card-caption">Step 5/5 · Running MBMP + coherence filter…</div>', unsafe_allow_html=True)
+                    status.markdown('<div class="card-caption">Step 5/5 · Detection…</div>', unsafe_allow_html=True)
                     progress.progress(90)
 
                     result = run_algorithm_multi(target_bands, median_ref, valid_lrad)
-                    result["date"] = target_date.strftime("%Y-%m-%d")
-                    # Store best correlation for display
+                    result["date"] = tdate.strftime("%Y-%m-%d")
                     result["b4_correlation"] = float(top_k[0][0]) if top_k else np.nan
 
-                    output_folder = RESULT_DIR / target_date.strftime("%Y%m%d")
-                    output_folder.mkdir(parents=True, exist_ok=True)
+                    out_folder = RESULT_DIR / tdate.strftime("%Y%m%d")
+                    out_folder.mkdir(parents=True, exist_ok=True)
                     paths = {}
-                    for key in ("relative", "gaussian", "final", "valid"):
-                        paths[key] = output_folder / f"{key}.tif"
-                        save_raster(paths[key], result[key], profile, key in ("final", "valid"))
+                    for key in ("relative", "gaussian", "initial", "coherent", "final", "valid"):
+                        paths[key] = out_folder / f"{key}.tif"
+                        save_raster(paths[key], result[key], profile, key in ("initial", "coherent", "final", "valid"))
                     st.session_state.result = result
                     st.session_state.paths = paths
                     st.session_state.output_profile = profile
                     st.session_state.png_outputs = {
                         "relative": image_png(result["relative"]),
                         "gaussian": image_png(result["gaussian"]),
+                        "initial": image_png(result["initial"], mask=True),
+                        "coherent": image_png(result["coherent"], mask=True),
                         "final": image_png(result["final"], mask=True),
                         "valid": image_png(result["valid"], mask=True),
                     }
                     progress.progress(100, text="Done")
-                    st.success(f"Processing complete · median of {len(top_k)} references")
+                    st.success(f"Complete · median of {len(top_k)} references")
 
-                    # Sanity check
+                    # Informational only
                     ratio = result["final_count"] / max(1, result["valid_count"])
-                    if ratio < 0.0005:
-                        st.warning(
-                            f"⚠️ Signal ratio = {ratio*100:.4f}% ({result['final_count']:,} / {result['valid_count']:,}). "
-                            f"This is likely **background noise**, not a real plume. "
-                            f"Try `Threshold = 4.0` or a different target/reference pair."
+                    if result["final_count"] == 0:
+                        st.info(
+                            f"ℹ️ Final mask is empty. Pipeline counts: initial={result['initial_count']}, "
+                            f"coherent={result['coherent_count']}, final={result['final_count']}. "
+                            f"Lower the **Coherence** or **Min pixels/region** sliders and re-run."
                         )
-                except Exception as error:
-                    st.error(f"Detection failed: {error}")
+                    elif ratio < 0.0005:
+                        st.info(
+                            f"ℹ️ Small but nonzero signal: {result['final_count']:,} pixels "
+                            f"({ratio*100:.4f}% of valid). Verify visually if the pattern is spatially coherent."
+                        )
+                except Exception as e:
+                    st.error(f"Detection failed: {e}")
     else:
-        st.markdown('<div class="card-title">Select scenes first</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card-title">Select a scene first</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════
@@ -930,60 +885,74 @@ if "result" in st.session_state:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
     metrics = st.columns(6, gap="small")
-    corr_text = f"{result['b4_correlation']:.3f}" if np.isfinite(result.get("b4_correlation", np.nan)) else "n/a"
-    metrics[0].metric("SWIR correlation", corr_text)
-    metrics[1].metric("Valid pixels", f"{result['valid_count']:,}")
+    ct = f"{result['b4_correlation']:.3f}" if np.isfinite(result.get("b4_correlation", np.nan)) else "n/a"
+    metrics[0].metric("SWIR corr", ct)
+    metrics[1].metric("Valid", f"{result['valid_count']:,}")
     metrics[2].metric("Initial", f"{result['initial_count']:,}")
     metrics[3].metric("Coherent", f"{result.get('coherent_count', 0):,}")
     metrics[4].metric("Final", f"{result['final_count']:,}")
     metrics[5].metric("Regions", result["regions"])
-    result_items = [("relative", "Relative MBMP", "Anomaly"), ("gaussian", "Gaussian filtered", "Smoothed"), ("final", "Methane candidates", "Final mask"), ("valid", "Valid pixels", "Validity mask")]
-    result_cols = st.columns(4, gap="small")
-    for col, (key, title, tag) in zip(result_cols, result_items):
+
+    # Show 5 panels: initial / coherent / connected / final / valid
+    result_items = [
+        ("relative", "Relative MBMP", "Anomaly"),
+        ("gaussian", "Smoothed", "Gaussian"),
+        ("initial", "Above threshold", "Stage 1"),
+        ("coherent", "Coherent only", "Stage 2"),
+        ("final", "Final mask", "Stage 3"),
+        ("valid", "Valid pixels", "Validity"),
+    ]
+    result_cols = st.columns(3, gap="small")
+    for idx, (key, title, tag) in enumerate(result_items):
+        col = result_cols[idx % 3]
         with col:
             st.markdown(f'<div class="card-caption" style="font-weight:700;">{tag} · {title}</div>', unsafe_allow_html=True)
             preview_col, legend_col = st.columns([3.6, 1.0], gap="small")
             with preview_col:
                 st.image(png_outputs[key], use_container_width=True, output_format="PNG")
             with legend_col:
-                st.markdown(legend_html("mask" if key == "final" else "valid" if key == "valid" else "continuous"), unsafe_allow_html=True)
-            path = st.session_state.paths[key]
-            fmt = st.selectbox("Download format", ["GeoTIFF", "PNG + World File"], key=f"fmt_{key}")
-            if fmt == "GeoTIFF":
-                st.download_button("⬇ GeoTIFF", path.read_bytes(), file_name=path.name, mime="image/tiff", key=f"dl_tif_{key}", use_container_width=True)
-            else:
-                pkg = georeferenced_png_package(result[key], profile, mask=key in ("final", "valid"))
-                st.download_button("⬇ PNG package", pkg, file_name=f"{key}_png.zip", mime="application/zip", key=f"dl_png_{key}", use_container_width=True)
-    st.markdown(f'<div class="card-caption">Initial (pixel &gt; threshold): <b>{result["initial_count"]:,}</b> → Coherent (≥{PARAMS["spatial_coherence_min"]}/8 neighbors): <b>{result.get("coherent_count", 0):,}</b> → After size/shape filter: <b>{result["final_count"]:,}</b></div>', unsafe_allow_html=True)
-    st.download_button("⬇ Reference table CSV", st.session_state.reference_table.to_csv(index=False), file_name="references.csv", mime="text/csv", key="dl_ref_csv", use_container_width=False)
-    st.markdown('<div class="card-caption">⚠️ This is a screening tool. Candidate masks are NOT physical methane concentration.</div>', unsafe_allow_html=True)
+                if key in ("initial", "coherent", "final"):
+                    st.markdown(legend_html("mask"), unsafe_allow_html=True)
+                elif key == "valid":
+                    st.markdown(legend_html("valid"), unsafe_allow_html=True)
+                else:
+                    st.markdown(legend_html("continuous"), unsafe_allow_html=True)
+
+    st.markdown(f'<div class="card-caption">Funnel: <b>{result["initial_count"]:,}</b> above threshold → <b>{result.get("coherent_count", 0):,}</b> coherent → <b>{result["final_count"]:,}</b> final · {result["regions"]:,} regions.</div>', unsafe_allow_html=True)
+
+    dl1, dl2 = st.columns([1, 1], gap="small")
+    with dl1:
+        st.download_button("⬇ Reference table CSV", st.session_state.reference_table.to_csv(index=False),
+                            file_name="references.csv", mime="text/csv", key="dl_ref_csv", use_container_width=True)
+    with dl2:
+        st.download_button("⬇ 30-day-ready GeoTIFF pack", st.session_state.paths["final"].read_bytes(),
+                            file_name="final_mask.tif", mime="image/tiff", key="dl_final_tif", use_container_width=True)
 
     # ──────────────────────────────────────────────────────────────────
-    # 05b · SENTINEL-5P CH4
+    # 05b · SENTINEL-5P CH4 CONTEXT
     # ──────────────────────────────────────────────────────────────────
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). All pixels shown. Colormap = anomaly relative to local mean.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). Colormap = anomaly relative to local mean.</div>', unsafe_allow_html=True)
 
     s5p_c1, s5p_c2 = st.columns([1, 3], gap="small")
     with s5p_c1:
-        run_s5p = st.button("🛰️  Fetch S5P CH4", type="primary", use_container_width=True, key="s5p_btn", disabled=not bool(st.session_state.get("cdse_auth")))
+        run_s5p = st.button("🛰️  Fetch S5P CH4", type="primary", use_container_width=True, key="s5p_btn",
+                             disabled=not bool(st.session_state.get("cdse_auth")))
     with s5p_c2:
-        s5p_days = st.slider("S5P temporal window (days)", 1, 30, 15, key="s5p_days")
+        s5p_days = st.slider("S5P window (days)", 1, 30, 15, key="s5p_days")
 
     if run_s5p:
         try:
             access_token = get_access_token()
-            target_date = get_datetime(st.session_state.get("target"))
-            if target_date is None:
-                raise RuntimeError("Target date missing.")
+            tdate = get_datetime(st.session_state.get("target"))
+            if tdate is None:
+                raise RuntimeError("No target date.")
             with st.spinner("Fetching S5P…"):
-                s5p_path = download_s5p_scene(
-                    st.session_state.aoi,
-                    target_date - timedelta(days=int(s5p_days)),
-                    target_date + timedelta(days=int(s5p_days)),
-                    access_token,
-                )
+                s5p_path = download_s5p_scene(st.session_state.aoi,
+                                               tdate - timedelta(days=int(s5p_days)),
+                                               tdate + timedelta(days=int(s5p_days)),
+                                               access_token)
             with rasterio.open(s5p_path) as src:
                 ch4 = src.read(1).astype(np.float32)
             ch4[~np.isfinite(ch4)] = np.nan
@@ -997,13 +966,13 @@ if "result" in st.session_state:
         ch4 = st.session_state.s5p_ch4
         v = ch4[np.isfinite(ch4)]
         if v.size < 2:
-            placeholder = float(np.nanmean(v)) if v.size > 0 else 1900.0
-            ch4 = np.full_like(ch4, placeholder)
+            ph = float(np.nanmean(v)) if v.size > 0 else 1900.0
+            ch4 = np.full_like(ch4, ph)
             v = ch4[np.isfinite(ch4)]
-            st.warning("No valid S5P pixels. Showing placeholder at AOI center.")
+            st.warning("No valid S5P pixels. Placeholder shown.")
         if v.size > 1:
             c1, c2, c3, c4 = st.columns(4, gap="small")
-            c1.metric("Mean CH4 (ppb)", f"{float(np.nanmean(v)):.1f}")
+            c1.metric("Mean (ppb)", f"{float(np.nanmean(v)):.1f}")
             c2.metric("Min", f"{float(np.nanmin(v)):.1f}")
             c3.metric("Max", f"{float(np.nanmax(v)):.1f}")
             c4.metric("Range", f"{float(np.nanmax(v) - np.nanmin(v)):.1f}")
