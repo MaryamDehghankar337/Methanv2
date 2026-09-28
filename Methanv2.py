@@ -1,24 +1,15 @@
 """Sentinel-2 methane candidate screening app.
 
-MBMC-faithful version (Cheng et al., Remote Sensing 2026)
+MBMC-faithful v2 (robust thresholding)
   • Aradkouh landfill (Tehran) as default AOI
   • Cloud cover 30% + last-30-days date defaults
-  • Strong noise suppression + signal-ratio warning
   • Robust reference selection with fallback
   • 30-day time-series + visual daily playback
   • Sentinel-5P CH4 with forced AOI-center display
 
 UI/design preserved from the original version.
-Algorithm engine re-implemented following the MBMC paper:
-  - c = Σ(B11·B12) / Σ(B12²)          [B12 in denominator]
-  - ΔR = (c·B12 − B11) / B12
-  - ΔΩ = ΔR / K_MBMP                    (K = 1e-5 → ppb)
-  - Large-scale background removal (σ = 100 px)
-  - Gaussian smoothing σ = 0.5
-  - Threshold = max(mean + 1σ, 5 ppb)
-  - LRAD only on target; shared c for both
-  - Keep only the largest connected component
-  - Spatial constraint: 10 km around Aradkouh landfill
+Algorithm engine re-implemented following the MBMC paper,
+with robust median/MAD thresholding tuned for landfill/urban AOIs.
 """
 from __future__ import annotations
 
@@ -66,37 +57,36 @@ RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 S5P_COLLECTION = "sentinel-5p-l2"
 
-# ── Default AOI: Aradkouh landfill (Tehran) ──────────────────────────
+# ── Default AOI: Aradkouh / Kahrizak landfill (Tehran) ───────────────
 DEFAULT_AOI = box(51.20, 35.40, 51.45, 35.60)
 
-# ── Aradkouh landfill site (spatial constraint center) ───────────────
+# ── Landfill site (spatial constraint center) ────────────────────────
 SITE_LAT = 35.505
 SITE_LON = 51.330
-SITE_RADIUS_M = 10000.0
+SITE_RADIUS_M = 5000.0     # tighter than before (was 10 km)
 
 # ── MBMC paper constants ─────────────────────────────────────────────
-K_MBMP = 1.0e-5          # ppb conversion factor
-DETREND_SIGMA = 100.0    # large-scale background removal (px)
-ABS_FLOOR_PPB = 5.0      # absolute detection floor (ppb)
-N_SIGMA = 1.0            # threshold multiplier (paper default)
-GAUSS_SIGMA = 0.5        # pre-threshold smoothing
-FLOOD_MIN_SIZE = 15      # minimum connected-component size
-DILATE_RADIUS_FINAL = 3  # final plume dilation (iterations)
+K_MBMP = 1.0e-5
+DETREND_SIGMA = 150.0      # larger than paper's 100 (more aggressive)
+ABS_FLOOR_PPB = 20.0       # realistic methane-anomaly floor (was 5)
+N_SIGMA = 2.5              # robust multiplier (paper: 1.0, but that assumes clean scenes)
+GAUSS_SIGMA = 1.5          # pre-threshold smoothing (paper: 0.5, but noisy AOI needs more)
+FLOOD_MIN_SIZE = 10
+DILATE_RADIUS_FINAL = 3
 
 PARAMS = {
     "b03_quantile": 0.05,
     "swir_saturation": 1.0,
     "ndwi_threshold": 0.20,
-    "ndvi_threshold": 0.40,   # relaxed for landfill/urban surroundings
-    "ndbi_threshold": 0.35,   # relaxed so landfill surface isn't removed
+    "ndvi_threshold": 0.45,   # relaxed further for landfill surroundings
+    "ndbi_threshold": 0.40,   # relaxed so landfill surface survives LRAD
     "ndsi_threshold": 0.42,
-    "lrad_dilation": 1,       # paper uses 1 iteration
-    # ── MBMC-aligned segmentation ────────────────────────────────
+    "lrad_dilation": 1,
     "gaussian_sigma": GAUSS_SIGMA,
     "threshold_sigma": N_SIGMA,
     "min_component_pixels": FLOOD_MIN_SIZE,
     "final_dilation": DILATE_RADIUS_FINAL,
-    "min_solidity": 0.0,      # disabled (paper doesn't use solidity)
+    "min_solidity": 0.0,
     "b12_epsilon": 1e-6,
     "min_valid_ref_pixels": 50,
     "abs_floor_ppb": ABS_FLOOR_PPB,
@@ -285,7 +275,6 @@ function evaluatePixel(sample) {
 
 
 def s5p_evalscript():
-    """Always return dataMask=1 so pixels are never filtered out."""
     return """//VERSION=3
 function setup() {
   return {
@@ -294,7 +283,6 @@ function setup() {
   };
 }
 function evaluatePixel(sample) {
-  // FORCE dataMask=1: never drop a pixel, even if QA is low.
   return [sample.CH4, 1.0];
 }
 """
@@ -338,7 +326,6 @@ def download_scene(item, aoi, access_token):
 
 
 def download_s5p_scene(aoi, date_from, date_to, access_token):
-    """Download Sentinel-5P CH4. No mosaickingOrder, no minQa — accept all pixels."""
     aoi = ensure_aoi(aoi)
     cache_id = hashlib.sha256(
         json.dumps(["s5p_ch4_v3", aoi, str(date_from), str(date_to)], sort_keys=True).encode()
@@ -404,11 +391,10 @@ def normalized_difference(first, second):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  CORE ALGORITHM (MBMC-faithful)
+#  CORE ALGORITHM (MBMC-faithful + robust thresholding)
 # ══════════════════════════════════════════════════════════════════════
 
 def calculate_lrad(bands, q_value):
-    """Learning-based Robust Anomaly Detection mask (paper Algorithm 1)."""
     finite = np.logical_and.reduce([np.isfinite(bands[band]) for band in BANDS])
     artifact = ((bands["B11"] >= PARAMS["swir_saturation"]) & (bands["B12"] >= PARAMS["swir_saturation"]))
     artifact |= bands["B03"] <= q_value
@@ -423,16 +409,16 @@ def calculate_lrad(bands, q_value):
 
 
 def calculate_c(b11, b12, valid):
-    """Paper formula: c = Σ(B11·B12) / Σ(B12²)."""
+    """c = Σ(B11·B12) / Σ(B12²)."""
     use = valid & np.isfinite(b11) & np.isfinite(b12) & (b11 > 0.05) & (b12 > 0.05)
     if use.sum() < 100:
         return 1.0
     x = b12[use].astype(np.float64)
     y = b11[use].astype(np.float64)
-    denominator = float(np.sum(x * x))
-    if denominator <= 0:
+    denom = float(np.sum(x * x))
+    if denom <= 0:
         return 1.0
-    return float(np.sum(y * x) / denominator)
+    return float(np.sum(y * x) / denom)
 
 
 def calculate_delta_R(b11, b12, c, valid):
@@ -449,7 +435,6 @@ def calculate_delta_R(b11, b12, c, valid):
 
 
 def remove_large_scale_background(dOmega, valid_mask, sigma=DETREND_SIGMA):
-    """Normalized Gaussian high-pass filter (paper detrending step)."""
     finite_valid = valid_mask & np.isfinite(dOmega)
     d = np.where(finite_valid, dOmega, 0.0).astype(np.float64)
     w = finite_valid.astype(np.float32)
@@ -476,7 +461,6 @@ def normalized_gaussian(data, valid_mask, sigma):
 
 
 def make_spatial_mask(shape, profile, lat=SITE_LAT, lon=SITE_LON, radius_m=SITE_RADIUS_M):
-    """Circular mask centered on the Aradkouh landfill."""
     transform = profile["transform"]
     crs = profile["crs"]
     try:
@@ -487,7 +471,6 @@ def make_spatial_mask(shape, profile, lat=SITE_LAT, lon=SITE_LON, radius_m=SITE_
     row = int(row); col = int(col)
     h, w = shape
     if not (0 <= row < h and 0 <= col < w):
-        # site not in tile → return full-true mask
         return np.ones(shape, dtype=bool), (row, col)
     rows, cols = np.ogrid[:h, :w]
     px = abs(transform.a)
@@ -496,32 +479,32 @@ def make_spatial_mask(shape, profile, lat=SITE_LAT, lon=SITE_LON, radius_m=SITE_
     return dist_m <= radius_m, (row, col)
 
 
-def run_algorithm(target, reference, profile):
-    """MBMC-faithful plume detection.
+def _robust_stats(values):
+    """Median + MAD-based sigma (robust to outliers)."""
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    median = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - median)))
+    # 1.4826 * MAD ≈ σ for a normal distribution
+    sigma_robust = 1.4826 * mad if mad > 1e-9 else float(np.std(finite))
+    if not np.isfinite(sigma_robust) or sigma_robust <= 0:
+        sigma_robust = 1.0
+    return median, sigma_robust
 
-    Steps
-    -----
-    1.  LRAD on the target only.
-    2.  Fit c from the target (B12-denominator).
-    3.  ΔR = (c·B12 − B11) / B12 on both scenes.
-    4.  ΔΩ = (ΔR_target − ΔR_ref) / K_MBMP   → ppb
-    5.  Detrend: normalized Gaussian high-pass (σ = 100 px).
-    6.  Gaussian smooth σ = 0.5.
-    7.  Threshold: max(mean + 1σ, 5 ppb).
-    8.  Spatial constraint: 10 km around Aradkouh.
-    9.  Keep only the largest connected component.
-    10. Final dilation & valid-mask clipping.
-    """
-    # 1. LRAD — target only
+
+def run_algorithm(target, reference, profile):
+    """MBMC-faithful plume detection with robust (median/MAD) thresholding."""
+    # 1. LRAD on target only
     target_q = float(np.nanquantile(target["B03"], PARAMS["b03_quantile"]))
     valid = calculate_lrad(target, target_q)
     if valid.sum() < 100:
         raise RuntimeError("LRAD removed nearly all pixels. Relax thresholds or enlarge AOI.")
 
-    # 2. c from target (paper formula)
+    # 2. c from target
     c = calculate_c(target["B11"], target["B12"], valid)
 
-    # 3. ΔR per scene with shared c
+    # 3. ΔR on both scenes with shared c
     dR_t = calculate_delta_R(target["B11"], target["B12"], c, valid)
     dR_r = calculate_delta_R(reference["B11"], reference["B12"], c, valid)
 
@@ -531,40 +514,49 @@ def run_algorithm(target, reference, profile):
     dOmega = dOmega_t - dOmega_r
     dOmega[~valid] = np.nan
 
-    # 5. Detrend (remove large-scale atmospheric / surface gradients)
-    dOmega_detrended, _background = remove_large_scale_background(
-        dOmega, valid, sigma=DETREND_SIGMA
-    )
+    # 5. Detrend
+    dOmega_detrended, _ = remove_large_scale_background(dOmega, valid, sigma=DETREND_SIGMA)
 
     # 6. Gaussian smoothing
     d_smooth = normalized_gaussian(dOmega_detrended, valid, GAUSS_SIGMA)
 
-    # 7. Threshold
+    # 7. ROBUST threshold: median + N_SIGMA * MAD-based σ
     vals = d_smooth[np.isfinite(d_smooth)]
     if vals.size == 0:
         raise RuntimeError("No finite values after detrending. Try a different reference scene.")
-    mu = float(np.mean(vals))
-    sigma = float(np.std(vals))
-    threshold = max(mu + PARAMS["threshold_sigma"] * sigma, PARAMS["abs_floor_ppb"])
+
+    median, sigma_robust = _robust_stats(vals)
+    threshold = median + max(
+        PARAMS["threshold_sigma"] * sigma_robust,
+        PARAMS["abs_floor_ppb"],
+    )
 
     candidate = np.isfinite(d_smooth) & (d_smooth > threshold) & valid
 
-    # 8. Spatial constraint (Aradkouh landfill)
+    # 8. Spatial constraint
     spatial_mask, site_rc = make_spatial_mask(dOmega.shape, profile)
     candidate &= spatial_mask
 
-    # 9. Keep only the largest connected component
+    # 9. Keep only the largest connected component (paper convention)
     structure = np.ones((3, 3), dtype=np.uint8)
     labeled, n_labels = label(candidate, structure=structure)
     plume = np.zeros_like(candidate, dtype=bool)
     if n_labels > 0:
         sizes = np.bincount(labeled.ravel(), minlength=n_labels + 1)
         sizes[0] = 0
-        sizes = np.where(sizes >= PARAMS["min_component_pixels"], sizes, 0)
-        if sizes.max() > 0:
-            best_label = int(np.argmax(sizes))
-            plume = (labeled == best_label)
-            # sanity: reject implausibly large blobs
+        sizes_kept = np.where(sizes >= PARAMS["min_component_pixels"], sizes, 0)
+        if sizes_kept.max() > 0:
+            order = np.argsort(sizes_kept)[::-1]
+            order = order[order != 0]
+            best_label = int(order[0])
+            best_size = int(sizes_kept[best_label])
+            # If the top component is tiny, merge top-3 to avoid losing the plume
+            if best_size < 30 and len(order) >= 2:
+                top_labels = order[:3]
+                plume = np.isin(labeled, top_labels)
+            else:
+                plume = (labeled == best_label)
+            # Sanity: reject implausibly large blobs
             area_km2 = plume.sum() * (RESOLUTION * RESOLUTION) / 1e6
             if area_km2 > PARAMS["max_plume_area_km2"]:
                 plume[:] = False
@@ -582,8 +574,8 @@ def run_algorithm(target, reference, profile):
         "spatial_mask": spatial_mask,
         "initial": candidate,
         "final": plume,
-        "mean": mu,
-        "std": sigma,
+        "mean": median,          # display: median (robust center)
+        "std": sigma_robust,     # display: robust sigma
         "threshold": threshold,
         "regions": int(1 if plume.any() else 0),
         "valid_count": int(valid.sum()),
@@ -635,7 +627,6 @@ def image_png(array, mask=False):
 
 
 def ch4_anomaly_png(array):
-    """Special PNG for S5P CH4 highlighting anomalies relative to local mean."""
     from PIL import Image
     import matplotlib.pyplot as plt
     data = np.asarray(array).astype(np.float32)
@@ -1048,7 +1039,6 @@ with action_col:
                     progress.progress(25, text="Downloading target bands…")
                     target_bands, profile = read_stack(download_scene(target, st.session_state.aoi, access_token))
 
-                    # ── Robust reference selection ────────────────────
                     best_reference = None
                     best_correlation = -np.inf
                     best_valid_count = 0
@@ -1128,7 +1118,6 @@ with action_col:
                     result["b4_correlation"] = best_correlation if np.isfinite(best_correlation) else float("nan")
                     result["date"] = target_date.strftime("%Y-%m-%d")
 
-                    # ── Signal-ratio sanity check ─────────────────────
                     signal_ratio = result["final_count"] / max(1, result["valid_count"])
                     result["signal_ratio"] = float(signal_ratio)
 
@@ -1152,14 +1141,20 @@ with action_col:
                     progress.progress(100, text="Ready to detect · outputs are ready")
                     st.success("Processing completed")
 
-                    if signal_ratio < 0.0001:
+                    if result["final_count"] == 0:
                         st.warning(
-                            f"⚠️ **Low signal-to-noise ratio detected.** "
-                            f"The final candidate mask covers only **{signal_ratio*100:.4f}%** of valid pixels "
+                            f"⚠️ **No plume above threshold detected.** "
+                            f"Median ΔΩ = {result['mean']:.2f} ppb, robust σ = {result['std']:.2f} ppb, "
+                            f"threshold = {result['threshold']:.2f} ppb. "
+                            f"Try lowering the Threshold multiplier to 1.5–2.0, or pick a different "
+                            f"target/reference date pair."
+                        )
+                    elif signal_ratio < 0.00005:
+                        st.warning(
+                            f"⚠️ **Very small final mask.** "
+                            f"The candidate mask covers only **{signal_ratio*100:.5f}%** of valid pixels "
                             f"({result['final_count']:,} / {result['valid_count']:,}). "
-                            f"This is likely **noise**, not a real methane plume. "
-                            f"Try increasing the threshold multiplier to 2.0–3.0, or pick a "
-                            f"different target/reference date pair."
+                            f"This may be a weak plume or residual noise."
                         )
                 except Exception as error:
                     st.error(f"Detection failed: {error}")
@@ -1185,7 +1180,7 @@ if "result" in st.session_state:
     metrics[2].metric("Initial", f"{result['initial_count']:,}")
     metrics[3].metric("Final", f"{result['final_count']:,}")
     metrics[4].metric("Regions", result["regions"])
-    metrics[5].metric("Threshold", f"{result['threshold']:.5f}")
+    metrics[5].metric("Threshold", f"{result['threshold']:.2f}")
     result_items = [
         ("relative", "Relative ΔΩ (raw)", "Anomaly"),
         ("detrended", "ΔΩ after detrend", "Detrended"),
@@ -1213,7 +1208,6 @@ if "result" in st.session_state:
                 st.download_button("⬇ Download Georeferenced PNG package", png_package, file_name=f"{key}_georeferenced_png.zip", mime="application/zip", key=f"download_png_compact_{key}", use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-    # Valid-mask card (kept as before but separate row)
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     vc1, vc2 = st.columns([1, 3], gap="small")
     with vc1:
@@ -1226,16 +1220,13 @@ if "result" in st.session_state:
         st.download_button("⬇ Download validity mask (GeoTIFF)", vpath.read_bytes(), file_name=vpath.name, mime="image/tiff", key="download_valid_mask", use_container_width=False)
 
     removed_pixels = max(0, int(result["initial_count"]) - int(result["final_count"]))
-    st.markdown(f'<div class="result-note"><b>Candidate cleanup:</b> regions smaller than <b>{int(PARAMS["min_component_pixels"]):,} pixels</b> were excluded, then only the largest region was kept (MBMC paper convention). Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · Removed: <b>{removed_pixels:,}</b> · c = <b>{result["c"]:.4f}</b> · Detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · Floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="result-note"><b>Robust thresholding:</b> median = <b>{result["mean"]:.2f} ppb</b>, robust σ = <b>{result["std"]:.2f} ppb</b>, threshold = <b>{result["threshold"]:.2f} ppb</b>. Only the largest connected region ≥ <b>{int(PARAMS["min_component_pixels"]):,} px</b> was kept (MBMC convention). Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · c = <b>{result["c"]:.4f}</b> · detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
     d1, d2 = st.columns([1, 3], gap="small")
     with d1:
         st.download_button("⬇ Reference table CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection.csv", mime="text/csv", key="download_reference_csv_compact", use_container_width=True)
     with d2:
         st.markdown('<div class="card-caption" style="margin-top:0.55rem;">ΔΩ (ppb) is a screening quantity following the MBMC framework (Cheng et al., 2026); it is not physical methane concentration or an emission rate.</div>', unsafe_allow_html=True)
 
-    # ──────────────────────────────────────────────────────────────────
-    # 05a · 30-DAY TIME SERIES
-    # ──────────────────────────────────────────────────────────────────
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05a · 30-DAY TIME SERIES & VISUAL PLAYBACK</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-caption">Track daily changes of relative ΔΩ (ppb) over the 30-day window. Use the slider below the chart to visually scrub through each day.</div>', unsafe_allow_html=True)
@@ -1360,9 +1351,6 @@ if "result" in st.session_state:
                 m2.metric("Max ΔΩ (ppb)", f"{frame['max_mbmp']:.2f}")
                 m3.metric("Candidate pixels", f"{frame['final_pixels']:,}")
 
-    # ──────────────────────────────────────────────────────────────────
-    # 05b · SENTINEL-5P CH4 CONTEXT
-    # ──────────────────────────────────────────────────────────────────
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). All pixels are shown (no QA filtering). Visualization is <b>anomaly relative to the local mean</b>.</div>', unsafe_allow_html=True)
