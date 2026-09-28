@@ -1,15 +1,13 @@
-"""Sentinel-2 methane screening app v3.
+"""Sentinel-2 methane screening app v4.
 
-This version addresses scattered detections and missing landfill-area detections:
-- Correct SCL handling: SCL=2 is retained as a separate dark/cast-shadow class,
-  not silently treated as valid methane evidence.
-- Uses SCL + dataMask quality screening.
-- Uses a stable relative SWIR absorption score based on B11/B12 log-ratios.
-- Uses robust per-pixel temporal reference statistics from several scenes.
-- Uses a scene-level robust background and a local anomaly score.
-- Adds spatial coherence, morphological closing and connected-component filters.
-- Reports raw, coherent and final masks separately.
-- Does not claim that every red pixel is methane.
+v4 keeps the v3 detection changes while restoring the working UI elements:
+- Copernicus login form and logout button.
+- Legends for every output.
+- White date-input text on dark fields.
+- More robust reference scoring: it uses raw finite pixels first and does
+  not fail merely because strict quality masking left too few pixels.
+- Reference search is allowed across the complete target +/- window.
+- Reference selection falls back gracefully and reports diagnostic counts.
 """
 from __future__ import annotations
 
@@ -33,14 +31,7 @@ import requests
 import streamlit as st
 from folium.plugins import Draw
 from PIL import Image
-from scipy.ndimage import (
-    binary_closing,
-    binary_dilation,
-    binary_erosion,
-    gaussian_filter,
-    label,
-    uniform_filter,
-)
+from scipy.ndimage import binary_closing, binary_dilation, gaussian_filter, label, uniform_filter
 from shapely.geometry import box, mapping, shape
 from shapely.ops import unary_union
 from skimage.morphology import disk
@@ -52,22 +43,21 @@ PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 RESOLUTION = 20
 DATA_BANDS = ["B03", "B04", "B08", "B11", "B12"]
 OUTPUT_BANDS = DATA_BANDS + ["SCL", "DATA_MASK"]
-CACHE_DIR = Path.home() / ".sentinel_methane_cache_v3"
-RESULT_DIR = Path.home() / ".sentinel_methane_results_v3"
+CACHE_DIR = Path.home() / ".sentinel_methane_cache_v4"
+RESULT_DIR = Path.home() / ".sentinel_methane_results_v4"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULTS = {
-    "cloud_probability": 35.0,
     "threshold_sigma": 2.5,
-    "local_sigma": 5.0,
+    "local_sigma": 5,
     "min_component_pixels": 4,
-    "min_coherent_pixels": 6,
-    "final_dilation": 0,
-    "gaussian_sigma": 0.8,
-    "quality_dilation": 1,
+    "min_neighbours": 3,
+    "reference_days": 90,
     "max_reference_count": 8,
-    "min_reference_score": 0.70,
+    "min_reference_score": 0.55,
+    "quality_dilation": 1,
+    "gaussian_sigma": 0.8,
 }
 
 
@@ -85,7 +75,8 @@ def get_properties(item):
 
 def get_datetime(item) -> Optional[datetime]:
     data = as_dict(item)
-    value = get_properties(data).get("datetime") or get_properties(data).get("start_datetime")
+    props = get_properties(data)
+    value = props.get("datetime") or props.get("start_datetime")
     if value:
         try:
             return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
@@ -111,7 +102,7 @@ def get_cloud(item):
         try:
             return float(props[key])
         except Exception:
-            continue
+            pass
     return 100.0
 
 
@@ -125,7 +116,11 @@ def normalize_geometry(obj):
     if obj.get("type") == "Feature":
         return normalize_geometry(obj.get("geometry"))
     if obj.get("type") == "FeatureCollection":
-        geometries = [shape(g) for f in obj.get("features", []) if (g := normalize_geometry(f.get("geometry")))]
+        geometries = []
+        for feature in obj.get("features", []):
+            geometry = normalize_geometry(feature.get("geometry"))
+            if geometry:
+                geometries.append(shape(geometry))
         if not geometries:
             return None
         merged = unary_union(geometries)
@@ -156,16 +151,12 @@ def search_scenes(aoi, start, end, max_cloud):
 
 
 def authenticate_cdse(username, password, totp=""):
-    if not username.strip() or not password.strip():
+    username, password, totp = username.strip(), password.strip(), totp.strip()
+    if not username or not password:
         raise RuntimeError("Please enter your Copernicus email and password.")
-    form = {
-        "grant_type": "password",
-        "client_id": "cdse-public",
-        "username": username.strip(),
-        "password": password.strip(),
-    }
-    if totp.strip():
-        form["totp"] = totp.strip()
+    form = {"grant_type": "password", "client_id": "cdse-public", "username": username, "password": password}
+    if totp:
+        form["totp"] = totp
     response = requests.post(TOKEN_URL, data=form, timeout=90)
     if response.status_code >= 400:
         try:
@@ -176,23 +167,14 @@ def authenticate_cdse(username, password, totp=""):
     data = response.json()
     if not data.get("access_token"):
         raise RuntimeError("Copernicus did not return an access token.")
-    return {
-        "access_token": data["access_token"],
-        "refresh_token": data.get("refresh_token", ""),
-        "expires_at": time.time() + int(data.get("expires_in", 600)),
-        "username": username.strip(),
-    }
+    return {"access_token": data["access_token"], "refresh_token": data.get("refresh_token", ""), "expires_at": time.time() + int(data.get("expires_in", 600)), "username": username}
 
 
 def refresh_cdse_session(auth):
     refresh_token = auth.get("refresh_token", "")
     if not refresh_token:
         return None
-    response = requests.post(
-        TOKEN_URL,
-        data={"grant_type": "refresh_token", "client_id": "cdse-public", "refresh_token": refresh_token},
-        timeout=90,
-    )
+    response = requests.post(TOKEN_URL, data={"grant_type": "refresh_token", "client_id": "cdse-public", "refresh_token": refresh_token}, timeout=90)
     if response.status_code >= 400:
         return None
     data = response.json()
@@ -235,7 +217,7 @@ function evaluatePixel(sample) {
 """
 
 
-def download_scene(item, aoi, token, cloud_probability=35.0):
+def download_scene(item, aoi, token):
     item = as_dict(item)
     aoi = ensure_aoi(aoi)
     acquisition = get_datetime(item)
@@ -249,16 +231,13 @@ def download_scene(item, aoi, token, cloud_probability=35.0):
         return output
     folder.mkdir(parents=True, exist_ok=True)
     minx, miny, maxx, maxy = shape(aoi).bounds
-    latitude = math.radians((miny + maxy) / 2)
+    latitude = math.radians((miny + maxy) / 2.0)
     width = max(1, min(2500, int(abs(maxx - minx) * 111320 * math.cos(latitude) / RESOLUTION)))
     height = max(1, min(2500, int(abs(maxy - miny) * 111320 / RESOLUTION)))
     start = acquisition.strftime("%Y-%m-%dT00:00:00Z")
     end = (acquisition + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
     payload = {
-        "input": {
-            "bounds": {"bbox": [minx, miny, maxx, maxy], "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}},
-            "data": [{"type": "sentinel-2-l2a", "dataFilter": {"timeRange": {"from": start, "to": end}, "mosaickingOrder": "leastCC"}}],
-        },
+        "input": {"bounds": {"bbox": [minx, miny, maxx, maxy], "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}}, "data": [{"type": "sentinel-2-l2a", "dataFilter": {"timeRange": {"from": start, "to": end}, "mosaickingOrder": "leastCC"}}]},
         "output": {"width": width, "height": height, "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}]},
         "evalscript": evalscript(),
     }
@@ -283,30 +262,18 @@ def read_stack(path):
     return {band: array[index] for index, band in enumerate(OUTPUT_BANDS)}, profile
 
 
-def nd(first, second):
-    output = np.full(first.shape, np.nan, dtype=np.float32)
-    denominator = first + second
-    use = np.isfinite(first) & np.isfinite(second) & (np.abs(denominator) > 1e-8)
-    output[use] = (first[use] - second[use]) / denominator[use]
-    return output
-
-
 def quality_mask(bands):
     scl = np.rint(bands["SCL"]).astype(np.int16)
     data_mask = bands["DATA_MASK"] >= 0.5
     finite = np.logical_and.reduce([np.isfinite(bands[band]) for band in DATA_BANDS])
     positive = (bands["B11"] > 0) & (bands["B12"] > 0)
-    # SCL=2 is dark/cast shadow. It is not automatically deleted here;
-    # it is separately reported and excluded from methane evidence below.
     bad = np.isin(scl, [0, 1, 3, 7, 8, 9, 10, 11])
     return data_mask & finite & positive & ~bad
 
 
-def usable_methane_pixels(bands, valid, dilation=1):
+def usable_mask(bands, valid, dilation=1):
     scl = np.rint(bands["SCL"]).astype(np.int16)
-    dark_or_shadow = np.isin(scl, [2])
-    water = np.isin(scl, [6])
-    exclude = dark_or_shadow | water | ~valid
+    exclude = np.isin(scl, [2, 6]) | ~valid
     if dilation > 0:
         exclude = binary_dilation(exclude, structure=disk(int(dilation)))
     return valid & ~exclude
@@ -322,92 +289,56 @@ def robust_center_scale(values):
     return center, max(scale, 1e-8)
 
 
-def normalize_gaussian(values, valid, sigma):
+def normalized_gaussian(values, valid, sigma):
     numerator = gaussian_filter(np.where(valid, np.nan_to_num(values, nan=0.0), 0.0).astype(np.float32), sigma=float(sigma))
     denominator = gaussian_filter(valid.astype(np.float32), sigma=float(sigma))
-    output = np.full(values.shape, np.nan, dtype=np.float32)
+    result = np.full(values.shape, np.nan, dtype=np.float32)
     use = denominator > 0.25
-    output[use] = numerator[use] / denominator[use]
-    return output
+    result[use] = numerator[use] / denominator[use]
+    return result
 
 
-def local_zscore(values, valid, radius=5):
-    finite_values = np.where(valid, np.nan_to_num(values, nan=0.0), 0.0).astype(np.float32)
-    weights = valid.astype(np.float32)
+def local_zscore(values, valid, radius):
     size = int(radius) * 2 + 1
-    mean_num = uniform_filter(finite_values, size=size, mode="nearest")
-    weight_mean = uniform_filter(weights, size=size, mode="nearest")
-    local_mean = mean_num / np.maximum(weight_mean, 1e-6)
-    mean_sq = uniform_filter(finite_values * finite_values, size=size, mode="nearest") / np.maximum(weight_mean, 1e-6)
-    local_std = np.sqrt(np.maximum(mean_sq - local_mean * local_mean, 1e-8))
-    output = np.full(values.shape, np.nan, dtype=np.float32)
-    output[valid] = (values[valid] - local_mean[valid]) / local_std[valid]
-    return output
+    v = np.where(valid, np.nan_to_num(values, nan=0.0), 0.0).astype(np.float32)
+    w = valid.astype(np.float32)
+    local_mean = uniform_filter(v, size=size, mode="nearest") / np.maximum(uniform_filter(w, size=size, mode="nearest"), 1e-6)
+    local_sq = uniform_filter(v * v, size=size, mode="nearest") / np.maximum(uniform_filter(w, size=size, mode="nearest"), 1e-6)
+    local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 1e-8))
+    result = np.full(values.shape, np.nan, dtype=np.float32)
+    result[valid] = (values[valid] - local_mean[valid]) / local_std[valid]
+    return result
 
 
 def calculate_anomaly(target, reference, params):
-    target_valid = quality_mask(target)
-    reference_valid = quality_mask(reference)
-    common = target_valid & reference_valid
-    target_use = usable_methane_pixels(target, common, params["quality_dilation"])
-    reference_use = usable_methane_pixels(reference, common, params["quality_dilation"])
-    valid = target_use & reference_use
+    target_quality = quality_mask(target)
+    reference_quality = quality_mask(reference)
+    common = target_quality & reference_quality
+    valid = usable_mask(target, common, params["quality_dilation"]) & usable_mask(reference, common, params["quality_dilation"])
     if valid.sum() < 100:
-        raise RuntimeError(f"Too few usable pixels: {int(valid.sum())}")
-
-    # Relative SWIR absorption proxy. B12 is more methane-sensitive than B11.
+        raise RuntimeError(f"Too few usable pixels after quality masking: {int(valid.sum())}")
     target_ratio = np.full(valid.shape, np.nan, dtype=np.float32)
     reference_ratio = np.full(valid.shape, np.nan, dtype=np.float32)
     target_ratio[valid] = np.log(target["B12"][valid] / target["B11"][valid])
     reference_ratio[valid] = np.log(reference["B12"][valid] / reference["B11"][valid])
     relative = target_ratio - reference_ratio
     relative[~valid] = np.nan
-
-    raw_center, raw_scale = robust_center_scale(relative[valid])
-    global_z = (relative - raw_center) / raw_scale
-    smoothed = normalize_gaussian(global_z, valid, params["gaussian_sigma"])
-    local_z = local_zscore(smoothed, valid, params["local_sigma"])
-
-    scene_threshold = float(params["threshold_sigma"])
-    local_threshold = float(params["local_sigma_threshold"])
-    raw = valid & np.isfinite(smoothed) & (smoothed > scene_threshold)
-    local = valid & np.isfinite(local_z) & (local_z > local_threshold)
+    center, scale = robust_center_scale(relative[valid])
+    global_z = (relative - center) / scale
+    smoothed = normalized_gaussian(global_z, valid, params["gaussian_sigma"])
+    local_z = local_zscore(smoothed, valid, params["local_radius"])
+    raw = valid & np.isfinite(smoothed) & (smoothed > params["threshold_sigma"])
+    local = valid & np.isfinite(local_z) & (local_z > params["local_threshold"])
     initial = raw & local
-
-    # Require spatial support. Isolated one/two-pixel spikes are not coherent plumes.
     neighbourhood = uniform_filter(initial.astype(np.float32), size=3, mode="nearest") * 9
     coherent = initial & (neighbourhood >= int(params["min_neighbours"]))
     coherent = binary_closing(coherent, structure=disk(1))
-
     labels, _ = label(coherent, structure=np.ones((3, 3), dtype=np.uint8))
     sizes = np.bincount(labels.ravel())
     retained = np.where(sizes >= int(params["min_component_pixels"]))[0]
     retained = retained[retained != 0]
     connected = np.isin(labels, retained)
-
-    final = connected.copy()
-    if params["final_dilation"] > 0:
-        final = binary_dilation(final, structure=disk(int(params["final_dilation"]))) & valid
-
-    return {
-        "relative": relative,
-        "smoothed": smoothed,
-        "local_z": local_z,
-        "valid": valid,
-        "raw": raw,
-        "initial": initial,
-        "coherent": coherent,
-        "connected": connected,
-        "final": final,
-        "threshold": scene_threshold,
-        "local_threshold": local_threshold,
-        "valid_count": int(valid.sum()),
-        "raw_count": int(raw.sum()),
-        "initial_count": int(initial.sum()),
-        "coherent_count": int(coherent.sum()),
-        "final_count": int(final.sum()),
-        "regions": int(len(retained)),
-    }
+    return {"relative": relative, "smoothed": smoothed, "local_z": local_z, "valid": valid, "raw": raw, "initial": initial, "coherent": coherent, "final": connected, "threshold": float(params["threshold_sigma"]), "local_threshold": float(params["local_threshold"]), "valid_count": int(valid.sum()), "raw_count": int(raw.sum()), "initial_count": int(initial.sum()), "coherent_count": int(coherent.sum()), "final_count": int(connected.sum()), "regions": int(len(retained))}
 
 
 def robust_corr(a, b, valid):
@@ -421,13 +352,26 @@ def robust_corr(a, b, valid):
 
 
 def reference_score(target, reference):
-    valid = quality_mask(target) & quality_mask(reference)
-    if valid.sum() < 100:
-        return np.nan, np.nan, np.nan, np.nan, int(valid.sum())
-    c4 = robust_corr(target["B04"], reference["B04"], valid)
-    c11 = robust_corr(target["B11"], reference["B11"], valid)
-    c12 = robust_corr(target["B12"], reference["B12"], valid)
-    return np.nanmean([c4, c11, c12]), c4, c11, c12, int(valid.sum())
+    # Strict quality score first.
+    strict = quality_mask(target) & quality_mask(reference)
+    candidates = [("strict", strict)]
+    # Fallback score: finite positive reflectance, excluding only no-data.
+    finite = np.logical_and.reduce([np.isfinite(target[b]) & np.isfinite(reference[b]) for b in DATA_BANDS])
+    finite &= (target["B11"] > 0) & (target["B12"] > 0) & (reference["B11"] > 0) & (reference["B12"] > 0)
+    candidates.append(("finite", finite))
+    best = None
+    for mode, valid in candidates:
+        if valid.sum() < 100:
+            continue
+        c4 = robust_corr(target["B04"], reference["B04"], valid)
+        c11 = robust_corr(target["B11"], reference["B11"], valid)
+        c12 = robust_corr(target["B12"], reference["B12"], valid)
+        score = np.nanmean([c4, c11, c12])
+        if np.isfinite(score) and (best is None or score > best[0]):
+            best = (score, c4, c11, c12, int(valid.sum()), mode)
+    if best is None:
+        return np.nan, np.nan, np.nan, np.nan, 0, "none"
+    return best
 
 
 def save_raster(path, array, profile, mask=False):
@@ -480,10 +424,10 @@ def create_map(aoi):
     return fmap
 
 
-def scene_label(scene, scenes):
-    scene = next((x for x in scenes if as_dict(x).get("id") == scene), None)
+def scene_label(scene_id, scenes):
+    scene = next((x for x in scenes if as_dict(x).get("id") == scene_id), None)
     if scene is None:
-        return "Unknown"
+        return str(scene_id)
     dt = get_datetime(scene)
     return f"{dt.strftime('%Y-%m-%d') if dt else 'Unknown'} | {get_tile(scene) or 'Unknown'} | cloud {get_cloud(scene):.1f}%"
 
@@ -494,15 +438,29 @@ def get_references(target, aoi, reference_days, max_cloud):
         return []
     candidates = search_scenes(aoi, target_dt - timedelta(days=int(reference_days)), target_dt + timedelta(days=int(reference_days)), max_cloud)
     target_id = as_dict(target).get("id")
-    target_tile = get_tile(target)
-    return [s for s in candidates if as_dict(s).get("id") != target_id and get_tile(s) == target_tile]
+    tile = get_tile(target)
+    return [s for s in candidates if as_dict(s).get("id") != target_id and get_tile(s) == tile]
+
+
+def legend_html(kind):
+    if kind == "mask":
+        rows = [("#dc1e1e", "Candidate / selected pixels"), ("#000000", "Background / rejected")]
+    elif kind == "valid":
+        rows = [("#dc1e1e", "Usable quality pixels"), ("#000000", "Cloud / shadow / invalid")]
+    else:
+        rows = [("#b43232", "Higher anomaly"), ("#3250b4", "Lower anomaly"), ("#ffffff", "No data")]
+    rows_html = "".join(f'<div style="display:flex;align-items:center;gap:.4rem;margin-top:.35rem;font-size:.75rem;"><span style="width:18px;height:14px;background:{color};border:1px solid #555;border-radius:2px;display:inline-block;"></span><span>{text}</span></div>' for color, text in rows)
+    return f'<div style="background:#fff;border:1px solid #d7e4e7;border-radius:10px;padding:.65rem;min-height:95px;"><div style="font-weight:800;">Legend</div>{rows_html}</div>'
 
 
 st.set_page_config(page_title="Sentinel-2 Methane Screening", page_icon="🛰️", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""<style>
-.stApp{background:#f1faee;color:#111!important}.block-container{max-width:1700px;padding-top:3.9rem!important}.app-header,.app-card{background:#fff;border:1px solid #d8e6e8;border-radius:15px;box-shadow:0 2px 10px rgba(29,53,87,.05)}.app-header{display:flex;justify-content:space-between;padding:.75rem 1rem;margin-bottom:.9rem}.app-title{font-size:1.45rem;font-weight:850}.app-card{padding:.75rem;height:100%}.section-label{display:inline-block;background:#a8dadc;border-radius:999px;padding:.2rem .55rem;font-size:.65rem;font-weight:800}.card-title{font-weight:800}.card-caption{font-size:.75rem}.stApp p,.stApp label,.stApp span,.stApp td,.stApp th{color:#111!important}.stButton>button,.stDownloadButton>button{border-radius:9px;font-weight:750}.stButton>button[kind="primary"]{background:#e63946;border-color:#e63946;color:white!important}.stButton>button[kind="primary"] *{color:white!important}.stDownloadButton>button{background:#fff;border:1px solid #a8dadc;color:#111!important}footer{visibility:hidden}
-</style>""", unsafe_allow_html=True)
-st.markdown("""<div class="app-header"><div><div class="app-title">🛰️ Sentinel-2 Methane Screening</div><div class="card-caption">Quality-masked SWIR anomaly screening at 20 m · v3</div></div><div>20 m processing</div></div>""", unsafe_allow_html=True)
+st.markdown("""
+<style>
+:root{--bg:#f1faee;--red:#e63946;--border:#d8e6e8;--dark:#292a33}
+.stApp{background:var(--bg);color:#111!important}[data-testid="stHeader"]{background:var(--bg)!important}[data-testid="stSidebar"]{display:none}.block-container{max-width:1700px;padding-top:3.9rem!important;padding-left:1.2rem;padding-right:1.2rem}.app-header,.app-card{background:#fff;border:1px solid var(--border);border-radius:15px;box-shadow:0 2px 10px rgba(29,53,87,.05)}.app-header{display:flex;justify-content:space-between;align-items:center;padding:.75rem 1rem;margin-bottom:.9rem}.app-title{font-size:1.45rem;font-weight:850}.app-card{padding:.75rem;height:100%}.section-label{display:inline-block;background:#a8dadc;color:#111!important;border-radius:999px;padding:.2rem .55rem;font-size:.65rem;font-weight:800}.card-title{font-size:1rem;font-weight:800}.card-caption{font-size:.75rem}.stApp p,.stApp label,.stApp span,.stApp td,.stApp th,.stApp li{color:#111!important}.stButton>button,.stDownloadButton>button{border-radius:9px;min-height:2.15rem;font-weight:750}.stButton>button[kind="primary"]{background:var(--red);border-color:var(--red);color:#fff!important}.stButton>button[kind="primary"] *{color:#fff!important}.stDownloadButton>button{background:#fff;border:1px solid #a8dadc;color:#111!important}.date-white div[data-baseweb="input"],.date-white div[data-baseweb="input"]>div,.date-white input{background:var(--dark)!important;color:#fff!important;-webkit-text-fill-color:#fff!important;caret-color:#fff!important;opacity:1!important}.date-white input::placeholder{color:#cfd3dc!important}.result-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:.8rem}.result-card{min-width:0}.legend{margin-top:.4rem}footer{visibility:hidden}
+</style>
+""", unsafe_allow_html=True)
+st.markdown("""<div class="app-header"><div><div class="app-title">🛰️ Sentinel-2 Methane Screening</div><div class="card-caption">Quality-masked SWIR anomaly screening at 20 m · v4</div></div><div>20 m processing</div></div>""", unsafe_allow_html=True)
 
 if "aoi" not in st.session_state:
     st.session_state.aoi = mapping(box(51.25, 35.65, 51.45, 35.80))
@@ -512,6 +470,7 @@ with map_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">01 · STUDY AREA</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-title">Area of Interest</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">Draw or edit the study area directly on the map.</div>', unsafe_allow_html=True)
     map_data = st_folium(create_map(st.session_state.aoi), height=385, width=1000, key="aoi_map")
     if map_data and map_data.get("all_drawings"):
         new_aoi = normalize_geometry({"type": "FeatureCollection", "features": map_data["all_drawings"]})
@@ -523,19 +482,21 @@ with search_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">02 · SEARCH</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-title">Scene Search</div>', unsafe_allow_html=True)
-    c1, c2 = st.columns(2)
-    with c1:
-        start_date = st.date_input("Search start", date(2026, 7, 1), key="search_start")
-    with c2:
-        end_date = st.date_input("Search end", date.today(), key="search_end")
-    c1, c2 = st.columns(2)
-    with c1:
+    d1, d2 = st.columns(2)
+    with d1:
+        start_date = st.date_input("Start date", date(2026, 7, 1), key="start_date")
+    with d2:
+        end_date = st.date_input("End date", date.today(), key="end_date")
+    st.markdown('<style>.stDateInput input{background:#292a33!important;color:#fff!important;-webkit-text-fill-color:#fff!important}</style>', unsafe_allow_html=True)
+    s1, s2 = st.columns(2)
+    with s1:
         max_cloud = st.slider("Scene cloud cover (%)", 0.0, 100.0, 50.0, key="scene_cloud")
-    with c2:
-        reference_days = st.slider("Reference window (days)", 7, 180, 90, key="reference_days")
+    with s2:
+        reference_days = st.slider("Reference window (days)", 7, 180, DEFAULTS["reference_days"], key="reference_days")
     if st.button("🔎 Search Sentinel-2 scenes", type="primary", use_container_width=True):
         try:
-            st.session_state.scene_results = search_scenes(st.session_state.aoi, datetime.combine(start_date, datetime.min.time()), datetime.combine(end_date, datetime.max.time()), max_cloud)
+            scenes = search_scenes(st.session_state.aoi, datetime.combine(start_date, datetime.min.time()), datetime.combine(end_date, datetime.max.time()), max_cloud)
+            st.session_state.scene_results = scenes or []
             st.session_state.pop("target", None)
             st.session_state.pop("result", None)
             st.success(f"{len(st.session_state.scene_results)} scene(s) found")
@@ -547,8 +508,8 @@ with search_col:
         table = pd.DataFrame([{"date": get_datetime(s), "tile": get_tile(s), "cloud": get_cloud(s)} for s in scenes]).sort_values(["date", "cloud"], na_position="last")
         st.dataframe(table, use_container_width=True, height=112, hide_index=True)
         ids = [as_dict(s).get("id") for s in scenes if as_dict(s).get("id")]
-        selected = st.selectbox("Target scene", ids, format_func=lambda value: scene_label(value, scenes), key="target_scene")
-        st.session_state.target = next((s for s in scenes if as_dict(s).get("id") == selected), None)
+        selected_id = st.selectbox("Target scene", ids, format_func=lambda value: scene_label(value, scenes), key="target_scene")
+        st.session_state.target = next((s for s in scenes if as_dict(s).get("id") == selected_id), None)
     st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown('<div style="height:.25rem"></div>', unsafe_allow_html=True)
@@ -558,14 +519,14 @@ with settings_col:
     st.markdown('<div class="section-label">03 · DETECTION</div>', unsafe_allow_html=True)
     p1, p2, p3, p4 = st.columns(4)
     with p1:
-        threshold_sigma = st.number_input("Scene threshold", 0.5, 6.0, 2.5, 0.1, key="threshold_sigma")
+        threshold_sigma = st.number_input("Scene threshold", 0.5, 6.0, DEFAULTS["threshold_sigma"], 0.1, key="threshold_sigma")
     with p2:
         local_threshold = st.number_input("Local threshold", 0.5, 8.0, 2.0, 0.1, key="local_threshold")
     with p3:
-        min_pixels = st.number_input("Minimum component pixels", 1, 1000, 4, 1, key="min_pixels")
+        min_pixels = st.number_input("Minimum candidate pixels", 1, 1000, DEFAULTS["min_component_pixels"], 1, key="min_pixels")
     with p4:
-        min_neighbours = st.number_input("Neighbour support / 9", 1, 9, 3, 1, key="min_neighbours")
-    st.markdown('<div class="card-caption">The app now shows raw, coherent and final masks separately. This prevents small candidates from disappearing silently.</div>', unsafe_allow_html=True)
+        min_neighbours = st.number_input("Neighbour support / 9", 1, 9, DEFAULTS["min_neighbours"], 1, key="min_neighbours")
+    st.markdown('<div class="card-caption">Raw and final candidate masks are both retained, so small landfill signals are not silently removed.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with process_col:
@@ -573,23 +534,31 @@ with process_col:
     st.markdown('<div class="section-label">04 · PROCESS</div>', unsafe_allow_html=True)
     auth = st.session_state.get("cdse_auth")
     if auth:
-        st.success(f"Copernicus connected · {auth.get('username','')}")
+        st.markdown(f'<div style="background:#e8f7ea;border:1px solid #9ed2a4;border-radius:9px;padding:.45rem .6rem;color:#155724!important;font-weight:700;">✓ Copernicus connected · {auth.get("username", "")}</div>', unsafe_allow_html=True)
+        if st.button("Log out", key="logout", use_container_width=True):
+            st.session_state.pop("cdse_auth", None)
+            st.rerun()
     else:
+        st.markdown('<div class="card-title">Copernicus login</div>', unsafe_allow_html=True)
+        st.link_button("🌐 Open Copernicus website", "https://dataspace.copernicus.eu/", use_container_width=True)
         with st.form("login_form", clear_on_submit=True):
-            username = st.text_input("Copernicus email")
+            username = st.text_input("Copernicus email", placeholder="your-email@example.com")
             password = st.text_input("Copernicus password", type="password")
-            totp = st.text_input("2FA code (optional)")
+            totp = st.text_input("2FA code (optional)", max_chars=8)
             login = st.form_submit_button("🔐 Login & connect", type="primary", use_container_width=True)
         if login:
             try:
-                st.session_state.cdse_auth = authenticate_cdse(username, password, totp)
+                with st.spinner("Connecting to Copernicus…"):
+                    st.session_state.cdse_auth = authenticate_cdse(username, password, totp)
+                st.success("Copernicus login successful")
                 st.rerun()
             except Exception as error:
                 st.error(str(error))
     target = st.session_state.get("target")
     if target is not None:
-        target_dt = get_datetime(target)
-        run = st.button("🛰️ Download AOI & detect methane", type="primary", use_container_width=True, disabled=not bool(st.session_state.get("cdse_auth")))
+        dt = get_datetime(target)
+        st.markdown(f'<div class="card-title">Target ready</div><div class="card-caption">{dt.strftime("%Y-%m-%d") if dt else "Unknown"} · {get_tile(target) or "Unknown tile"}</div>', unsafe_allow_html=True)
+        run = st.button("🛰️ Download AOI & detect methane", type="primary", use_container_width=True, disabled=not bool(st.session_state.get("cdse_auth")), key="run_detection")
         if run:
             try:
                 token = get_access_token()
@@ -599,29 +568,29 @@ with process_col:
                 progress.progress(20, text="Searching reference window…")
                 references = get_references(target, st.session_state.aoi, reference_days, max_cloud)
                 if not references:
-                    raise RuntimeError("No same-tile references found. Increase the reference window.")
-                scored = []
-                rows = []
+                    raise RuntimeError("No same-tile references found. Increase the reference window or cloud limit.")
+                scored, rows = [], []
                 for i, reference in enumerate(references, 1):
                     progress.progress(20 + int(45 * i / max(1, len(references))), text=f"Downloading reference {i}/{len(references)}…")
                     path = download_scene(reference, st.session_state.aoi, token)
                     bands, _ = read_stack(path)
-                    score, c4, c11, c12, count = reference_score(target_bands, bands)
-                    rows.append({"id": as_dict(reference).get("id"), "date": get_datetime(reference), "tile": get_tile(reference), "cloud": get_cloud(reference), "score": score, "b4": c4, "b11": c11, "b12": c12, "valid": count})
+                    score, c4, c11, c12, count, mode = reference_score(target_bands, bands)
+                    rows.append({"id": as_dict(reference).get("id"), "date": get_datetime(reference), "tile": get_tile(reference), "cloud": get_cloud(reference), "score": score, "b4": c4, "b11": c11, "b12": c12, "valid_pixels": count, "score_mode": mode})
                     if np.isfinite(score):
                         scored.append((score, reference, bands))
                 st.session_state.reference_table = pd.DataFrame(rows).sort_values("score", ascending=False, na_position="last")
                 if not scored:
-                    raise RuntimeError("No reference could be scored.")
+                    diagnostics = st.session_state.reference_table[["date", "cloud", "valid_pixels", "score_mode"]].to_string(index=False) if not st.session_state.reference_table.empty else "No rows"
+                    raise RuntimeError(f"No reference could be scored. Diagnostic table:\n{diagnostics}")
                 scored.sort(key=lambda x: x[0], reverse=True)
                 selected_refs = [x for x in scored if x[0] >= DEFAULTS["min_reference_score"]][:DEFAULTS["max_reference_count"]] or scored[:3]
                 reference_stack = {band: np.nanmedian(np.stack([x[2][band] for x in selected_refs]), axis=0).astype(np.float32) for band in OUTPUT_BANDS}
                 progress.progress(75, text="Running coherent anomaly detection…")
-                params = {"threshold_sigma": float(threshold_sigma), "local_sigma": DEFAULTS["local_sigma"], "local_sigma_threshold": float(local_threshold), "min_component_pixels": int(min_pixels), "min_neighbours": int(min_neighbours), "final_dilation": DEFAULTS["final_dilation"], "gaussian_sigma": DEFAULTS["gaussian_sigma"], "quality_dilation": DEFAULTS["quality_dilation"]}
+                params = {"threshold_sigma": float(threshold_sigma), "local_threshold": float(local_threshold), "local_radius": DEFAULTS["local_sigma"], "min_component_pixels": int(min_pixels), "min_neighbours": int(min_neighbours), "gaussian_sigma": DEFAULTS["gaussian_sigma"], "quality_dilation": DEFAULTS["quality_dilation"]}
                 result = calculate_anomaly(target_bands, reference_stack, params)
                 result["reference_count"] = len(selected_refs)
                 result["reference_best_score"] = float(selected_refs[0][0])
-                folder = RESULT_DIR / (target_dt.strftime("%Y%m%d") if target_dt else "unknown")
+                folder = RESULT_DIR / (dt.strftime("%Y%m%d") if dt else "unknown")
                 folder.mkdir(parents=True, exist_ok=True)
                 paths = {}
                 for key in ("relative", "smoothed", "local_z", "valid", "raw", "initial", "coherent", "final"):
@@ -635,6 +604,8 @@ with process_col:
                 st.success("Detection completed")
             except Exception as error:
                 st.error(f"Detection failed: {error}")
+    else:
+        st.markdown('<div class="card-caption">Search and select a target scene first.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 if "result" in st.session_state:
@@ -650,14 +621,15 @@ if "result" in st.session_state:
     metrics[4].metric("Coherent", f"{result['coherent_count']:,}")
     metrics[5].metric("Final", f"{result['final_count']:,}")
     metrics[6].metric("Regions", result["regions"])
-    outputs = [("relative", "Relative SWIR anomaly", False), ("smoothed", "Smoothed anomaly", False), ("local_z", "Local z-score", False), ("valid", "Validity mask", True), ("raw", "Raw candidates", True), ("coherent", "Coherent candidates", True), ("final", "Final candidates", True)]
-    columns = st.columns(7, gap="small")
-    for column, (key, title, mask) in zip(columns, outputs):
-        with column:
+    outputs = [("relative", "Relative SWIR anomaly", "continuous"), ("smoothed", "Smoothed anomaly", "continuous"), ("local_z", "Local z-score", "continuous"), ("valid", "Validity mask", "valid"), ("raw", "Raw candidates", "mask"), ("initial", "Threshold candidates", "mask"), ("coherent", "Coherent candidates", "mask"), ("final", "Final candidates", "mask")]
+    columns = st.columns(4, gap="small")
+    for index, (key, title, kind) in enumerate(outputs):
+        with columns[index % 4]:
             st.markdown(f"**{title}**")
             st.image(st.session_state.pngs[key], use_container_width=True)
-            st.download_button("⬇ GeoTIFF", st.session_state.paths[key].read_bytes(), file_name=st.session_state.paths[key].name, mime="image/tiff", key=f"download_{key}", use_container_width=True)
-    st.markdown(f'<div class="card-caption">Valid pixels are quality-screened and usable for the comparison. Raw pixels show spectral anomaly; coherent pixels additionally require local spatial support. Final pixels pass the connected-component filter. This is a screening product, not a physical methane concentration.</div>', unsafe_allow_html=True)
+            st.markdown(legend_html(kind), unsafe_allow_html=True)
+            st.download_button("⬇ Download GeoTIFF", st.session_state.paths[key].read_bytes(), file_name=st.session_state.paths[key].name, mime="image/tiff", key=f"download_{key}", use_container_width=True)
+    st.markdown('<div class="card-caption">Validity means usable quality pixels, not methane presence. Raw candidates are spectral anomalies; coherent and final candidates additionally pass spatial filters.</div>', unsafe_allow_html=True)
     if "reference_table" in st.session_state:
-        st.download_button("⬇ Reference CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection_v3.csv", mime="text/csv", use_container_width=True)
+        st.download_button("⬇ Download reference-selection CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection_v4.csv", mime="text/csv", use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
