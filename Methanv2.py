@@ -1,9 +1,9 @@
 """Sentinel-2 methane candidate screening app.
 
 Integrated version with:
-  • Stronger noise suppression (stricter thresholds + shape filtering)
+  • Stronger noise suppression (raw-data threshold + shape & isolation filters)
   • 30-day time-series tracking with VISUAL daily playback
-  • Sentinel-5P / TROPOMI CH4 context layer (fixed collection type)
+  • Sentinel-5P / TROPOMI CH4 context layer (fixed collection type + mosaicking)
 
 UI/design is preserved exactly as in the original version.
 """
@@ -26,7 +26,7 @@ import requests
 import rasterio
 import streamlit as st
 from folium.plugins import Draw
-from scipy.ndimage import binary_dilation, gaussian_filter, label
+from scipy.ndimage import binary_dilation, gaussian_filter, label, convolve
 from shapely.geometry import box, mapping, shape
 from shapely.ops import unary_union
 from skimage.morphology import disk
@@ -44,7 +44,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── FIX: correct S5P collection type ──────────────────────────────────
-S5P_COLLECTION = "sentinel-5p-l2"   # was: "sentinel-5p-l2-ch4-offl"
+S5P_COLLECTION = "sentinel-5p-l2"
 
 PARAMS = {
     "b03_quantile": 0.05,
@@ -54,19 +54,18 @@ PARAMS = {
     "ndbi_threshold": 0.20,
     "ndsi_threshold": 0.42,
     "lrad_dilation": 2,
-    # ── Noise tuning ──────────────────────────────────────────────────
-    "gaussian_sigma": 1.5,        # was 1.2 — more smoothing
-    "threshold_sigma": 1.0,       # was 1.8 — lower to catch plume
-    "min_component_pixels": 12,   # was 10
+    # ── Balanced noise / signal tuning ────────────────────────────────
+    "gaussian_sigma": 1.2,
+    "threshold_sigma": 2.5,
+    "min_component_pixels": 20,
     "final_dilation": 4,
-    "min_solidity": 0.30,
-    # ── Stability fix: avoid blow-up when B12 ≈ 0 ────────────────────
+    "min_solidity": 0.45,
     "b12_epsilon": 1e-6,
 }
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  HELPERS  (unchanged)
+#  HELPERS
 # ══════════════════════════════════════════════════════════════════════
 
 def as_dict(item):
@@ -242,7 +241,6 @@ function evaluatePixel(sample) {
 """
 
 
-# ── FIX: S5P evalscript uses correct band names ──────────────────────
 def s5p_evalscript():
     return """//VERSION=3
 function setup() {
@@ -294,7 +292,6 @@ def download_scene(item, aoi, access_token):
     return output_path
 
 
-# ── FIX: correct collection type and band handling ───────────────────
 def download_s5p_scene(aoi, date_from, date_to, access_token):
     """Download Sentinel-5P CH4 + dataMask for a given time window."""
     aoi = ensure_aoi(aoi)
@@ -314,15 +311,15 @@ def download_s5p_scene(aoi, date_from, date_to, access_token):
                 "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"},
             },
             "data": [{
-                "type": S5P_COLLECTION,          # "sentinel-5p-l2"
+                "type": S5P_COLLECTION,
                 "dataFilter": {
                     "timeRange": {
                         "from": date_from.strftime("%Y-%m-%dT00:00:00Z"),
                         "to": date_to.strftime("%Y-%m-%dT23:59:59Z"),
                     },
-                    "mosaickingOrder": "leastCC",
+                    # ── FIX: S5P only accepts mostRecent / leastRecent ──
+                    "mosaickingOrder": "mostRecent",
                 },
-                "processing": {"minQa": 50},    # QA >= 50 %
             }],
         },
         "output": {
@@ -384,7 +381,6 @@ def calculate_c(b11, b12, valid):
     return float(np.sum(x * y) / max(np.sum(x * x), 1e-20))
 
 
-# ── FIX: higher epsilon to avoid division blow-up ────────────────────
 def calculate_mbsp(b11, b12, c, valid):
     output = np.full(b11.shape, np.nan, dtype=np.float32)
     use = valid & np.isfinite(b11) & np.isfinite(b12) & (np.abs(b12) > PARAMS["b12_epsilon"])
@@ -392,7 +388,6 @@ def calculate_mbsp(b11, b12, c, valid):
     return output
 
 
-# ── FIX: threshold computed from GAUSSIAN-filtered data ──────────────
 def run_algorithm(target, reference):
     target_q = float(np.nanquantile(target["B03"], PARAMS["b03_quantile"]))
     reference_q = float(np.nanquantile(reference["B03"], PARAMS["b03_quantile"]))
@@ -404,16 +399,17 @@ def run_algorithm(target, reference):
     finite = np.isfinite(relative)
     if not finite.any():
         raise RuntimeError("LRAD removed all pixels. Reduce artifact thresholds or use a smaller valid AOI.")
+
     values = relative[finite].astype(np.float64)
     mean_value = float(np.mean(values))
     std_value = float(np.std(values))
+
     # Gaussian smoothing
     gaussian = gaussian_filter(np.where(finite, relative, mean_value), sigma=PARAMS["gaussian_sigma"])
-    # ⚠️ Threshold from FILTERED data (not raw) → much less noise
-    gaussian_values = gaussian[finite]
-    gaussian_mean = float(np.mean(gaussian_values))
-    gaussian_std = float(np.std(gaussian_values))
-    threshold = gaussian_mean + PARAMS["threshold_sigma"] * gaussian_std
+
+    # ── FIX: threshold from RAW data (not filtered) ───────────────────
+    threshold = mean_value + PARAMS["threshold_sigma"] * std_value
+
     initial = valid & np.isfinite(gaussian) & (gaussian > threshold)
     labels, _ = label(initial, structure=np.ones((3, 3), dtype=np.uint8))
     sizes = np.bincount(labels.ravel())
@@ -436,6 +432,17 @@ def run_algorithm(target, reference):
         retained = np.array(sorted(keep)) if keep else np.array([], dtype=int)
 
     connected = np.isin(labels, retained)
+
+    # ── NEW: remove isolated candidate pixels (salt-and-pepper noise) ─
+    if connected.any():
+        neighbor_count = convolve(
+            connected.astype(np.uint8),
+            np.ones((3, 3), dtype=np.uint8),
+            mode="constant",
+        )
+        isolated = connected & (neighbor_count <= 1)
+        connected[isolated] = False
+
     final = binary_dilation(connected, structure=disk(PARAMS["final_dilation"])) & valid
     return {
         "relative": relative,
@@ -576,7 +583,7 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  UI  (identical CSS / layout)
+#  UI
 # ══════════════════════════════════════════════════════════════════════
 
 st.set_page_config(page_title="Sentinel-2 Methane", page_icon="🛰️", layout="wide", initial_sidebar_state="collapsed")
@@ -1057,7 +1064,7 @@ if "result" in st.session_state:
                     use_container_width=False,
                 )
 
-    # ── NEW: Visual daily playback (time-lapse) ───────────────────────
+    # ── Visual daily playback (time-lapse) ───────────────────────────
     if "daily_visuals" in st.session_state:
         visuals = st.session_state.daily_visuals
         dates_available = sorted(visuals.keys())
@@ -1086,11 +1093,11 @@ if "result" in st.session_state:
                 m3.metric("Candidate pixels", f"{frame['final_pixels']:,}")
 
     # ──────────────────────────────────────────────────────────────────
-    # 05b · SENTINEL-5P CH4 CONTEXT  (fixed)
+    # 05b · SENTINEL-5P CH4 CONTEXT
     # ──────────────────────────────────────────────────────────────────
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km) for regional context. QA ≥ 50 % applied. Not a plume-scale product; use it to compare S2 candidates with regional methane patterns.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km) for regional context. Not a plume-scale product; use it to compare S2 candidates with regional methane patterns.</div>', unsafe_allow_html=True)
 
     s5p_col1, s5p_col2 = st.columns([1, 3], gap="small")
     with s5p_col1:
