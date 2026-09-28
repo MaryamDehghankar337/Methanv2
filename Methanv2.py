@@ -1,11 +1,13 @@
 """Sentinel-2 methane candidate screening app.
 
-Integrated version with:
-  • Stronger noise suppression (raw-data threshold + shape & isolation filters)
-  • 30-day time-series tracking with VISUAL daily playback
-  • Sentinel-5P / TROPOMI CH4 context layer (fixed collection type + mosaicking)
+Integrated version:
+  • Aradkouh landfill (Tehran) as default AOI
+  • Cloud cover 30% + last-30-days date defaults
+  • Balanced noise / signal tuning
+  • 30-day time-series + visual daily playback
+  • Sentinel-5P CH4 context with anomaly-based visualization
 
-UI/design is preserved exactly as in the original version.
+UI/design preserved from the original version.
 """
 from __future__ import annotations
 
@@ -26,7 +28,13 @@ import requests
 import rasterio
 import streamlit as st
 from folium.plugins import Draw
-from scipy.ndimage import binary_dilation, gaussian_filter, label, convolve
+from scipy.ndimage import (
+    binary_dilation,
+    binary_opening,
+    gaussian_filter,
+    label,
+    convolve,
+)
 from shapely.geometry import box, mapping, shape
 from shapely.ops import unary_union
 from skimage.morphology import disk
@@ -43,8 +51,10 @@ RESULT_DIR = Path.home() / ".sentinel_methane_results"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── FIX: correct S5P collection type ──────────────────────────────────
 S5P_COLLECTION = "sentinel-5p-l2"
+
+# ── Default AOI: Aradkouh landfill (Tehran) ──────────────────────────
+DEFAULT_AOI = box(51.29, 35.47, 51.35, 35.51)
 
 PARAMS = {
     "b03_quantile": 0.05,
@@ -54,12 +64,12 @@ PARAMS = {
     "ndbi_threshold": 0.20,
     "ndsi_threshold": 0.42,
     "lrad_dilation": 2,
-    # ── Balanced noise / signal tuning ────────────────────────────────
-    "gaussian_sigma": 1.2,
-    "threshold_sigma": 2.5,
-    "min_component_pixels": 20,
-    "final_dilation": 4,
-    "min_solidity": 0.45,
+    # ── Balanced tuning ───────────────────────────────────────────────
+    "gaussian_sigma": 1.3,
+    "threshold_sigma": 2.0,
+    "min_component_pixels": 15,
+    "final_dilation": 3,
+    "min_solidity": 0.35,
     "b12_epsilon": 1e-6,
 }
 
@@ -137,7 +147,7 @@ def normalize_geometry(obj):
 
 
 def ensure_aoi(obj):
-    return normalize_geometry(obj) or mapping(box(48.0, 29.0, 49.0, 30.0))
+    return normalize_geometry(obj) or mapping(DEFAULT_AOI)
 
 
 def search_scenes(aoi, start, end, max_cloud):
@@ -317,7 +327,6 @@ def download_s5p_scene(aoi, date_from, date_to, access_token):
                         "from": date_from.strftime("%Y-%m-%dT00:00:00Z"),
                         "to": date_to.strftime("%Y-%m-%dT23:59:59Z"),
                     },
-                    # ── FIX: S5P only accepts mostRecent / leastRecent ──
                     "mosaickingOrder": "mostRecent",
                 },
             }],
@@ -407,7 +416,7 @@ def run_algorithm(target, reference):
     # Gaussian smoothing
     gaussian = gaussian_filter(np.where(finite, relative, mean_value), sigma=PARAMS["gaussian_sigma"])
 
-    # ── FIX: threshold from RAW data (not filtered) ───────────────────
+    # Threshold from RAW data
     threshold = mean_value + PARAMS["threshold_sigma"] * std_value
 
     initial = valid & np.isfinite(gaussian) & (gaussian > threshold)
@@ -433,7 +442,11 @@ def run_algorithm(target, reference):
 
     connected = np.isin(labels, retained)
 
-    # ── NEW: remove isolated candidate pixels (salt-and-pepper noise) ─
+    # Morphological opening → removes thin connections
+    if connected.any():
+        connected = binary_opening(connected, structure=disk(1))
+
+    # Remove isolated candidate pixels (salt-and-pepper)
     if connected.any():
         neighbor_count = convolve(
             connected.astype(np.uint8),
@@ -471,7 +484,7 @@ def save_raster(path, array, profile, mask=False):
 
 def create_map(aoi):
     geometry = shape(ensure_aoi(aoi))
-    fmap = folium.Map([geometry.centroid.y, geometry.centroid.x], zoom_start=7, tiles="OpenStreetMap")
+    fmap = folium.Map([geometry.centroid.y, geometry.centroid.x], zoom_start=12, tiles="OpenStreetMap")
     folium.GeoJson(mapping(geometry), style_function=lambda _: {"color": "blue", "fill": False}).add_to(fmap)
     Draw(export=True, draw_options={"polyline": False, "circle": False, "marker": False, "circlemarker": False}).add_to(fmap)
     return fmap
@@ -501,11 +514,37 @@ def image_png(array, mask=False):
     return buffer.getvalue()
 
 
+def ch4_anomaly_png(array):
+    """Special PNG for S5P CH4 highlighting small anomalies around the mean."""
+    from PIL import Image
+    import matplotlib.pyplot as plt
+    data = np.asarray(array).astype(np.float32)
+    finite = np.isfinite(data)
+    rgb = np.full((*data.shape, 3), 255, dtype=np.uint8)
+    if finite.any() and finite.sum() > 1:
+        values = data[finite]
+        mean_val = float(np.mean(values))
+        anomaly = data - mean_val
+        # Symmetric scaling around zero
+        max_abs = float(np.percentile(np.abs(anomaly[finite]), 98))
+        if max_abs < 1e-6:
+            max_abs = float(np.max(np.abs(anomaly[finite])))
+        if max_abs > 0:
+            normalized = np.clip((np.nan_to_num(anomaly, nan=0) + max_abs) / (2.0 * max_abs), 0, 1)
+            rgb = (plt.get_cmap("RdBu_r")(normalized)[:, :, :3] * 255).astype(np.uint8)
+            rgb[~finite] = 255
+    buffer = io.BytesIO()
+    Image.fromarray(rgb).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def legend_html(kind):
     if kind == "mask":
         rows = [("#dc1e1e", "Methane candidate"), ("#000000", "Background / non-candidate")]
     elif kind == "valid":
         rows = [("#dc1e1e", "Valid pixels"), ("#000000", "Invalid / masked pixels")]
+    elif kind == "s5p":
+        rows = [("#b43232", "CH4 above local mean"), ("#3250b4", "CH4 below local mean"), ("#ffffff", "No data")]
     else:
         rows = [("#b43232", "Higher anomaly"), ("#3250b4", "Lower anomaly"), ("#ffffff", "No data")]
     items = "".join(f'<div class="legend-row"><span class="legend-swatch" style="background:{c};"></span><span>{t}</span></div>' for c, t in rows)
@@ -542,7 +581,6 @@ def georeferenced_png_package(array, profile, mask=False):
 # ══════════════════════════════════════════════════════════════════════
 
 def process_single_day(target_scene, reference_scenes, aoi, access_token, store_image=True):
-    """Process a single day → summary stats + optional PNG image."""
     try:
         target_date = get_datetime(target_scene)
         target_bands, _ = read_stack(download_scene(target_scene, aoi, access_token))
@@ -664,7 +702,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 if "aoi" not in st.session_state:
-    st.session_state.aoi = mapping(box(48.0, 29.0, 49.0, 30.0))
+    st.session_state.aoi = mapping(DEFAULT_AOI)
 
 map_col, control_col = st.columns([1.65, 1.0], gap="small")
 with map_col:
@@ -683,14 +721,17 @@ with control_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">02 · SEARCH</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-title">Scene Search</div>', unsafe_allow_html=True)
+    # ── Default: last 30 days ─────────────────────────────────────────
+    default_end = datetime.now().date()
+    default_start = default_end - timedelta(days=30)
     d1, d2 = st.columns(2, gap="small")
     with d1:
-        start_date = st.date_input("Start date", datetime.now().date() - timedelta(days=30), key="start_date")
+        start_date = st.date_input("Start date", default_start, key="start_date")
     with d2:
-        end_date = st.date_input("End date", datetime.now().date(), key="end_date")
+        end_date = st.date_input("End date", default_end, key="end_date")
     s1, s2 = st.columns(2, gap="small")
     with s1:
-        max_cloud = st.slider("Cloud cover (%)", 0.0, 100.0, 50.0, key="max_cloud")
+        max_cloud = st.slider("Cloud cover (%)", 0.0, 100.0, 30.0, key="max_cloud")
     with s2:
         reference_days = st.slider("Reference window (days)", 1, 90, 60, key="reference_days")
 
@@ -1034,7 +1075,6 @@ if "result" in st.session_state:
         except Exception as ts_error:
             st.error(f"Time series failed: {ts_error}")
 
-    # ── Line chart ────────────────────────────────────────────────────
     if "timeseries_df" in st.session_state:
         ts = st.session_state.timeseries_df
         if not ts.empty and "mean_mbmp" in ts.columns:
@@ -1064,7 +1104,6 @@ if "result" in st.session_state:
                     use_container_width=False,
                 )
 
-    # ── Visual daily playback (time-lapse) ───────────────────────────
     if "daily_visuals" in st.session_state:
         visuals = st.session_state.daily_visuals
         dates_available = sorted(visuals.keys())
@@ -1097,13 +1136,13 @@ if "result" in st.session_state:
     # ──────────────────────────────────────────────────────────────────
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km) for regional context. Not a plume-scale product; use it to compare S2 candidates with regional methane patterns.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km) for regional context. Visualization shows <b>anomaly relative to the local mean</b> so that small enhancements become visible. QA &lt; 0.5 filtered out.</div>', unsafe_allow_html=True)
 
     s5p_col1, s5p_col2 = st.columns([1, 3], gap="small")
     with s5p_col1:
         run_s5p = st.button("🛰️  Fetch S5P CH4", type="primary", use_container_width=True, key="s5p_button", disabled=not bool(st.session_state.get("cdse_auth")))
     with s5p_col2:
-        s5p_days = st.slider("S5P temporal window (days around target)", 1, 15, 5, key="s5p_days")
+        s5p_days = st.slider("S5P temporal window (days around target)", 1, 30, 15, key="s5p_days")
 
     if run_s5p:
         try:
@@ -1124,7 +1163,7 @@ if "result" in st.session_state:
                     qa = src.read(2).astype(np.float32)
                 else:
                     qa = np.ones_like(ch4)
-            # QA filter: keep only valid pixels (dataMask == 1)
+            # QA filter
             ch4[qa < 0.5] = np.nan
             st.session_state.s5p_ch4 = ch4
             st.success("S5P CH4 loaded")
@@ -1134,18 +1173,23 @@ if "result" in st.session_state:
     if "s5p_ch4" in st.session_state:
         ch4 = st.session_state.s5p_ch4
         valid_ch4 = ch4[np.isfinite(ch4)]
-        if valid_ch4.size > 0:
-            m1, m2, m3 = st.columns(3, gap="small")
-            m1.metric("Mean CH4 (ppb)", f"{float(np.nanmean(valid_ch4)):.1f}")
-            m2.metric("Max CH4 (ppb)", f"{float(np.nanmax(valid_ch4)):.1f}")
-            m3.metric("Valid S5P pixels", f"{int(valid_ch4.size):,}")
+        if valid_ch4.size > 1:
+            mean_val = float(np.nanmean(valid_ch4))
+            max_val = float(np.nanmax(valid_ch4))
+            min_val = float(np.nanmin(valid_ch4))
+            m1, m2, m3, m4 = st.columns(4, gap="small")
+            m1.metric("Mean CH4 (ppb)", f"{mean_val:.1f}")
+            m2.metric("Min CH4 (ppb)", f"{min_val:.1f}")
+            m3.metric("Max CH4 (ppb)", f"{max_val:.1f}")
+            m4.metric("Range (ppb)", f"{max_val - min_val:.1f}")
             img_col, leg_col = st.columns([3.6, 1.0], gap="small")
             with img_col:
-                st.image(image_png(ch4), use_container_width=True, output_format="PNG")
+                st.image(ch4_anomaly_png(ch4), use_container_width=True, output_format="PNG")
             with leg_col:
                 st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
-                st.markdown(legend_html("continuous"), unsafe_allow_html=True)
+                st.markdown(legend_html("s5p"), unsafe_allow_html=True)
+            st.markdown('<div class="card-caption">The visualization shows how each pixel deviates from the local mean (red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill may only occupy 1–2 pixels, so a clear plume pattern is not always resolvable.</div>', unsafe_allow_html=True)
         else:
-            st.warning("No valid S5P CH4 pixel for this AOI and window. Try widening the temporal window or check cloud cover.")
+            st.warning("Not enough valid S5P CH4 pixels. Increase the temporal window or check cloud cover.")
 
     st.markdown('</div>', unsafe_allow_html=True)
