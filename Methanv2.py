@@ -1,13 +1,10 @@
-"""Sentinel-2 methane screening app v4.
+"""Sentinel-2 Methane Screening - stable production-oriented version.
 
-v4 keeps the v3 detection changes while restoring the working UI elements:
-- Copernicus login form and logout button.
-- Legends for every output.
-- White date-input text on dark fields.
-- More robust reference scoring: it uses raw finite pixels first and does
-  not fail merely because strict quality masking left too few pixels.
-- Reference search is allowed across the complete target +/- window.
-- Reference selection falls back gracefully and reports diagnostic counts.
+This version focuses on robust execution and conservative candidate detection.
+It preserves login, legends, dark date fields, GeoTIFF downloads, and diagnostic
+outputs while fixing the repeated reference-scoring and quality-mask failures.
+
+Important: this is a screening workflow, not a physical methane retrieval.
 """
 from __future__ import annotations
 
@@ -43,21 +40,23 @@ PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 RESOLUTION = 20
 DATA_BANDS = ["B03", "B04", "B08", "B11", "B12"]
 OUTPUT_BANDS = DATA_BANDS + ["SCL", "DATA_MASK"]
-CACHE_DIR = Path.home() / ".sentinel_methane_cache_v4"
-RESULT_DIR = Path.home() / ".sentinel_methane_results_v4"
+CACHE_DIR = Path.home() / ".sentinel_methane_cache_final"
+RESULT_DIR = Path.home() / ".sentinel_methane_results_final"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULTS = {
-    "threshold_sigma": 2.5,
-    "local_sigma": 5,
-    "min_component_pixels": 4,
-    "min_neighbours": 3,
-    "reference_days": 90,
-    "max_reference_count": 8,
-    "min_reference_score": 0.55,
+    "scene_threshold": 3.0,
+    "local_threshold": 2.5,
+    "local_radius": 7,
+    "min_component_pixels": 20,
+    "min_neighbours": 5,
     "quality_dilation": 1,
-    "gaussian_sigma": 0.8,
+    "gaussian_sigma": 1.0,
+    "reference_days": 120,
+    "max_reference_count": 6,
+    "min_reference_score": 0.50,
+    "max_cloud": 40.0,
 }
 
 
@@ -118,9 +117,9 @@ def normalize_geometry(obj):
     if obj.get("type") == "FeatureCollection":
         geometries = []
         for feature in obj.get("features", []):
-            geometry = normalize_geometry(feature.get("geometry"))
-            if geometry:
-                geometries.append(shape(geometry))
+            geo = normalize_geometry(feature.get("geometry"))
+            if geo:
+                geometries.append(shape(geo))
         if not geometries:
             return None
         merged = unary_union(geometries)
@@ -165,9 +164,10 @@ def authenticate_cdse(username, password, totp=""):
             detail = None
         raise RuntimeError(detail or f"Copernicus login failed (HTTP {response.status_code}).")
     data = response.json()
-    if not data.get("access_token"):
+    token = data.get("access_token")
+    if not token:
         raise RuntimeError("Copernicus did not return an access token.")
-    return {"access_token": data["access_token"], "refresh_token": data.get("refresh_token", ""), "expires_at": time.time() + int(data.get("expires_in", 600)), "username": username}
+    return {"access_token": token, "refresh_token": data.get("refresh_token", ""), "expires_at": time.time() + int(data.get("expires_in", 600)), "username": username}
 
 
 def refresh_cdse_session(auth):
@@ -178,9 +178,10 @@ def refresh_cdse_session(auth):
     if response.status_code >= 400:
         return None
     data = response.json()
-    if not data.get("access_token"):
+    token = data.get("access_token")
+    if not token:
         return None
-    auth["access_token"] = data["access_token"]
+    auth["access_token"] = token
     auth["refresh_token"] = data.get("refresh_token", refresh_token)
     auth["expires_at"] = time.time() + int(data.get("expires_in", 600))
     return auth
@@ -257,18 +258,18 @@ def read_stack(path):
     with rasterio.open(path) as source:
         array = source.read().astype(np.float32)
         profile = source.profile.copy()
-    if array.shape[0] != len(OUTPUT_BANDS):
-        raise RuntimeError(f"Expected {len(OUTPUT_BANDS)} bands, received {array.shape[0]}.")
+    if array.shape[0] != 7:
+        raise RuntimeError(f"Expected 7 output bands, received {array.shape[0]}.")
     return {band: array[index] for index, band in enumerate(OUTPUT_BANDS)}, profile
 
 
 def quality_mask(bands):
     scl = np.rint(bands["SCL"]).astype(np.int16)
-    data_mask = bands["DATA_MASK"] >= 0.5
+    data_mask = np.isfinite(bands["DATA_MASK"]) & (bands["DATA_MASK"] > 0)
     finite = np.logical_and.reduce([np.isfinite(bands[band]) for band in DATA_BANDS])
-    positive = (bands["B11"] > 0) & (bands["B12"] > 0)
-    bad = np.isin(scl, [0, 1, 3, 7, 8, 9, 10, 11])
-    return data_mask & finite & positive & ~bad
+    positive = np.logical_and.reduce([bands[band] > 0 for band in DATA_BANDS])
+    bad_scl = np.isin(scl, [0, 1, 3, 7, 8, 9, 10, 11])
+    return data_mask & finite & positive & ~bad_scl
 
 
 def usable_mask(bands, valid, dilation=1):
@@ -292,18 +293,19 @@ def robust_center_scale(values):
 def normalized_gaussian(values, valid, sigma):
     numerator = gaussian_filter(np.where(valid, np.nan_to_num(values, nan=0.0), 0.0).astype(np.float32), sigma=float(sigma))
     denominator = gaussian_filter(valid.astype(np.float32), sigma=float(sigma))
-    result = np.full(values.shape, np.nan, dtype=np.float32)
+    output = np.full(values.shape, np.nan, dtype=np.float32)
     use = denominator > 0.25
-    result[use] = numerator[use] / denominator[use]
-    return result
+    output[use] = numerator[use] / denominator[use]
+    return output
 
 
 def local_zscore(values, valid, radius):
     size = int(radius) * 2 + 1
     v = np.where(valid, np.nan_to_num(values, nan=0.0), 0.0).astype(np.float32)
     w = valid.astype(np.float32)
-    local_mean = uniform_filter(v, size=size, mode="nearest") / np.maximum(uniform_filter(w, size=size, mode="nearest"), 1e-6)
-    local_sq = uniform_filter(v * v, size=size, mode="nearest") / np.maximum(uniform_filter(w, size=size, mode="nearest"), 1e-6)
+    local_weight = uniform_filter(w, size=size, mode="nearest")
+    local_mean = uniform_filter(v, size=size, mode="nearest") / np.maximum(local_weight, 1e-6)
+    local_sq = uniform_filter(v * v, size=size, mode="nearest") / np.maximum(local_weight, 1e-6)
     local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 1e-8))
     result = np.full(values.shape, np.nan, dtype=np.float32)
     result[valid] = (values[valid] - local_mean[valid]) / local_std[valid]
@@ -327,7 +329,7 @@ def calculate_anomaly(target, reference, params):
     global_z = (relative - center) / scale
     smoothed = normalized_gaussian(global_z, valid, params["gaussian_sigma"])
     local_z = local_zscore(smoothed, valid, params["local_radius"])
-    raw = valid & np.isfinite(smoothed) & (smoothed > params["threshold_sigma"])
+    raw = valid & np.isfinite(smoothed) & (smoothed > params["scene_threshold"])
     local = valid & np.isfinite(local_z) & (local_z > params["local_threshold"])
     initial = raw & local
     neighbourhood = uniform_filter(initial.astype(np.float32), size=3, mode="nearest") * 9
@@ -337,41 +339,34 @@ def calculate_anomaly(target, reference, params):
     sizes = np.bincount(labels.ravel())
     retained = np.where(sizes >= int(params["min_component_pixels"]))[0]
     retained = retained[retained != 0]
-    connected = np.isin(labels, retained)
-    return {"relative": relative, "smoothed": smoothed, "local_z": local_z, "valid": valid, "raw": raw, "initial": initial, "coherent": coherent, "final": connected, "threshold": float(params["threshold_sigma"]), "local_threshold": float(params["local_threshold"]), "valid_count": int(valid.sum()), "raw_count": int(raw.sum()), "initial_count": int(initial.sum()), "coherent_count": int(coherent.sum()), "final_count": int(connected.sum()), "regions": int(len(retained))}
+    final = np.isin(labels, retained)
+    return {"relative": relative, "smoothed": smoothed, "local_z": local_z, "valid": valid, "raw": raw, "initial": initial, "coherent": coherent, "final": final, "scene_threshold": float(params["scene_threshold"]), "local_threshold": float(params["local_threshold"]), "valid_count": int(valid.sum()), "raw_count": int(raw.sum()), "initial_count": int(initial.sum()), "coherent_count": int(coherent.sum()), "final_count": int(final.sum()), "regions": int(len(retained))}
 
 
 def robust_corr(a, b, valid):
     use = valid & np.isfinite(a) & np.isfinite(b)
-    if use.sum() < 100:
-        return np.nan
-    x, y = a[use].astype(float), b[use].astype(float)
+    count = int(use.sum())
+    if count < 20:
+        return np.nan, count
+    x, y = a[use].astype(np.float64), b[use].astype(np.float64)
     if np.std(x) < 1e-12 or np.std(y) < 1e-12:
-        return np.nan
-    return float(np.corrcoef(x, y)[0, 1])
+        return np.nan, count
+    return float(np.corrcoef(x, y)[0, 1]), count
 
 
 def reference_score(target, reference):
-    # Strict quality score first.
-    strict = quality_mask(target) & quality_mask(reference)
-    candidates = [("strict", strict)]
-    # Fallback score: finite positive reflectance, excluding only no-data.
-    finite = np.logical_and.reduce([np.isfinite(target[b]) & np.isfinite(reference[b]) for b in DATA_BANDS])
-    finite &= (target["B11"] > 0) & (target["B12"] > 0) & (reference["B11"] > 0) & (reference["B12"] > 0)
-    candidates.append(("finite", finite))
-    best = None
-    for mode, valid in candidates:
-        if valid.sum() < 100:
-            continue
-        c4 = robust_corr(target["B04"], reference["B04"], valid)
-        c11 = robust_corr(target["B11"], reference["B11"], valid)
-        c12 = robust_corr(target["B12"], reference["B12"], valid)
-        score = np.nanmean([c4, c11, c12])
-        if np.isfinite(score) and (best is None or score > best[0]):
-            best = (score, c4, c11, c12, int(valid.sum()), mode)
-    if best is None:
-        return np.nan, np.nan, np.nan, np.nan, 0, "none"
-    return best
+    finite_positive = np.logical_and.reduce([np.isfinite(target[b]) & np.isfinite(reference[b]) for b in DATA_BANDS])
+    finite_positive &= np.logical_and.reduce([target[b] > 0 for b in DATA_BANDS])
+    finite_positive &= np.logical_and.reduce([reference[b] > 0 for b in DATA_BANDS])
+    count = int(finite_positive.sum())
+    if count < 20:
+        return np.nan, np.nan, np.nan, np.nan, count, "none"
+    c4, _ = robust_corr(target["B04"], reference["B04"], finite_positive)
+    c11, _ = robust_corr(target["B11"], reference["B11"], finite_positive)
+    c12, _ = robust_corr(target["B12"], reference["B12"], finite_positive)
+    values = np.array([c4, c11, c12], dtype=float)
+    score = float(np.nanmean(values)) if np.isfinite(values).any() else np.nan
+    return score, c4, c11, c12, count, "finite"
 
 
 def save_raster(path, array, profile, mask=False):
@@ -392,12 +387,12 @@ def image_png(array, mask=False):
         rgb = np.full((*data.shape, 3), 255, dtype=np.uint8)
         if finite.any():
             values = data[finite]
-            lo, hi = float(np.percentile(values, 2)), float(np.percentile(values, 98))
-            if hi <= lo:
-                lo, hi = float(values.min()), float(values.max())
-            if hi > lo:
-                norm = np.clip((np.nan_to_num(data, nan=lo) - lo) / (hi - lo), 0, 1)
-                rgb = (plt.get_cmap("RdBu_r")(norm)[:, :, :3] * 255).astype(np.uint8)
+            low, high = float(np.percentile(values, 2)), float(np.percentile(values, 98))
+            if high <= low:
+                low, high = float(values.min()), float(values.max())
+            if high > low:
+                normalized = np.clip((np.nan_to_num(data, nan=low) - low) / (high - low), 0, 1)
+                rgb = (plt.get_cmap("RdBu_r")(normalized)[:, :, :3] * 255).astype(np.uint8)
                 rgb[~finite] = 255
     stream = io.BytesIO()
     Image.fromarray(rgb).save(stream, format="PNG")
@@ -438,8 +433,9 @@ def get_references(target, aoi, reference_days, max_cloud):
         return []
     candidates = search_scenes(aoi, target_dt - timedelta(days=int(reference_days)), target_dt + timedelta(days=int(reference_days)), max_cloud)
     target_id = as_dict(target).get("id")
-    tile = get_tile(target)
-    return [s for s in candidates if as_dict(s).get("id") != target_id and get_tile(s) == tile]
+    target_tile = get_tile(target)
+    same_tile = [s for s in candidates if as_dict(s).get("id") != target_id and get_tile(s) == target_tile]
+    return same_tile or [s for s in candidates if as_dict(s).get("id") != target_id]
 
 
 def legend_html(kind):
@@ -449,18 +445,18 @@ def legend_html(kind):
         rows = [("#dc1e1e", "Usable quality pixels"), ("#000000", "Cloud / shadow / invalid")]
     else:
         rows = [("#b43232", "Higher anomaly"), ("#3250b4", "Lower anomaly"), ("#ffffff", "No data")]
-    rows_html = "".join(f'<div style="display:flex;align-items:center;gap:.4rem;margin-top:.35rem;font-size:.75rem;"><span style="width:18px;height:14px;background:{color};border:1px solid #555;border-radius:2px;display:inline-block;"></span><span>{text}</span></div>' for color, text in rows)
-    return f'<div style="background:#fff;border:1px solid #d7e4e7;border-radius:10px;padding:.65rem;min-height:95px;"><div style="font-weight:800;">Legend</div>{rows_html}</div>'
+    body = "".join(f'<div class="legend-row"><span class="legend-swatch" style="background:{color};"></span><span>{text}</span></div>' for color, text in rows)
+    return f'<div class="result-legend"><div class="legend-heading">Legend</div>{body}</div>'
 
 
 st.set_page_config(page_title="Sentinel-2 Methane Screening", page_icon="🛰️", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""
 <style>
 :root{--bg:#f1faee;--red:#e63946;--border:#d8e6e8;--dark:#292a33}
-.stApp{background:var(--bg);color:#111!important}[data-testid="stHeader"]{background:var(--bg)!important}[data-testid="stSidebar"]{display:none}.block-container{max-width:1700px;padding-top:3.9rem!important;padding-left:1.2rem;padding-right:1.2rem}.app-header,.app-card{background:#fff;border:1px solid var(--border);border-radius:15px;box-shadow:0 2px 10px rgba(29,53,87,.05)}.app-header{display:flex;justify-content:space-between;align-items:center;padding:.75rem 1rem;margin-bottom:.9rem}.app-title{font-size:1.45rem;font-weight:850}.app-card{padding:.75rem;height:100%}.section-label{display:inline-block;background:#a8dadc;color:#111!important;border-radius:999px;padding:.2rem .55rem;font-size:.65rem;font-weight:800}.card-title{font-size:1rem;font-weight:800}.card-caption{font-size:.75rem}.stApp p,.stApp label,.stApp span,.stApp td,.stApp th,.stApp li{color:#111!important}.stButton>button,.stDownloadButton>button{border-radius:9px;min-height:2.15rem;font-weight:750}.stButton>button[kind="primary"]{background:var(--red);border-color:var(--red);color:#fff!important}.stButton>button[kind="primary"] *{color:#fff!important}.stDownloadButton>button{background:#fff;border:1px solid #a8dadc;color:#111!important}.date-white div[data-baseweb="input"],.date-white div[data-baseweb="input"]>div,.date-white input{background:var(--dark)!important;color:#fff!important;-webkit-text-fill-color:#fff!important;caret-color:#fff!important;opacity:1!important}.date-white input::placeholder{color:#cfd3dc!important}.result-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:.8rem}.result-card{min-width:0}.legend{margin-top:.4rem}footer{visibility:hidden}
+.stApp{background:var(--bg);color:#111!important}[data-testid="stHeader"]{background:var(--bg)!important}[data-testid="stSidebar"]{display:none}.block-container{max-width:1700px;padding-top:3.9rem!important;padding-left:1.2rem;padding-right:1.2rem}.app-header,.app-card{background:#fff;border:1px solid var(--border);border-radius:15px;box-shadow:0 2px 10px rgba(29,53,87,.05)}.app-header{display:flex;justify-content:space-between;align-items:center;padding:.75rem 1rem;margin-bottom:.9rem}.app-title{font-size:1.45rem;font-weight:850}.app-card{padding:.75rem;height:100%}.section-label{display:inline-block;background:#a8dadc;color:#111!important;border-radius:999px;padding:.2rem .55rem;font-size:.65rem;font-weight:800}.card-title{font-size:1rem;font-weight:800}.card-caption{font-size:.75rem}.stApp p,.stApp label,.stApp span,.stApp td,.stApp th,.stApp li{color:#111!important}.stButton>button,.stDownloadButton>button{border-radius:9px;min-height:2.15rem;font-weight:750}.stButton>button[kind="primary"]{background:var(--red);border-color:var(--red);color:#fff!important}.stButton>button[kind="primary"] *{color:#fff!important}.stDownloadButton>button{background:#fff;border:1px solid #a8dadc;color:#111!important}.stDateInput div[data-baseweb="input"],.stDateInput div[data-baseweb="input"]>div,.stDateInput input{background:var(--dark)!important;color:#fff!important;-webkit-text-fill-color:#fff!important;caret-color:#fff!important;opacity:1!important}.stDateInput input::placeholder{color:#cfd3dc!important}.result-legend{background:#fff;border:1px solid #d7e4e7;border-radius:10px;padding:.65rem;min-height:95px}.legend-heading{font-weight:800}.legend-row{display:flex;align-items:center;gap:.4rem;margin-top:.35rem;font-size:.75rem}.legend-swatch{width:18px;height:14px;border:1px solid #555;border-radius:2px;display:inline-block}footer{visibility:hidden}
 </style>
 """, unsafe_allow_html=True)
-st.markdown("""<div class="app-header"><div><div class="app-title">🛰️ Sentinel-2 Methane Screening</div><div class="card-caption">Quality-masked SWIR anomaly screening at 20 m · v4</div></div><div>20 m processing</div></div>""", unsafe_allow_html=True)
+st.markdown("""<div class="app-header"><div><div class="app-title">🛰️ Sentinel-2 Methane Screening</div><div class="card-caption">Quality-masked SWIR anomaly screening at 20 m · stable version</div></div><div>20 m processing</div></div>""", unsafe_allow_html=True)
 
 if "aoi" not in st.session_state:
     st.session_state.aoi = mapping(box(51.25, 35.65, 51.45, 35.80))
@@ -487,10 +483,9 @@ with search_col:
         start_date = st.date_input("Start date", date(2026, 7, 1), key="start_date")
     with d2:
         end_date = st.date_input("End date", date.today(), key="end_date")
-    st.markdown('<style>.stDateInput input{background:#292a33!important;color:#fff!important;-webkit-text-fill-color:#fff!important}</style>', unsafe_allow_html=True)
     s1, s2 = st.columns(2)
     with s1:
-        max_cloud = st.slider("Scene cloud cover (%)", 0.0, 100.0, 50.0, key="scene_cloud")
+        max_cloud = st.slider("Scene cloud cover (%)", 0.0, 100.0, DEFAULTS["max_cloud"], key="scene_cloud")
     with s2:
         reference_days = st.slider("Reference window (days)", 7, 180, DEFAULTS["reference_days"], key="reference_days")
     if st.button("🔎 Search Sentinel-2 scenes", type="primary", use_container_width=True):
@@ -519,14 +514,14 @@ with settings_col:
     st.markdown('<div class="section-label">03 · DETECTION</div>', unsafe_allow_html=True)
     p1, p2, p3, p4 = st.columns(4)
     with p1:
-        threshold_sigma = st.number_input("Scene threshold", 0.5, 6.0, DEFAULTS["threshold_sigma"], 0.1, key="threshold_sigma")
+        scene_threshold = st.number_input("Scene threshold", 0.5, 8.0, DEFAULTS["scene_threshold"], 0.1, key="scene_threshold")
     with p2:
-        local_threshold = st.number_input("Local threshold", 0.5, 8.0, 2.0, 0.1, key="local_threshold")
+        local_threshold = st.number_input("Local threshold", 0.5, 8.0, DEFAULTS["local_threshold"], 0.1, key="local_threshold")
     with p3:
-        min_pixels = st.number_input("Minimum candidate pixels", 1, 1000, DEFAULTS["min_component_pixels"], 1, key="min_pixels")
+        min_pixels = st.number_input("Minimum candidate pixels", 5, 1000, DEFAULTS["min_component_pixels"], 1, key="min_pixels")
     with p4:
-        min_neighbours = st.number_input("Neighbour support / 9", 1, 9, DEFAULTS["min_neighbours"], 1, key="min_neighbours")
-    st.markdown('<div class="card-caption">Raw and final candidate masks are both retained, so small landfill signals are not silently removed.</div>', unsafe_allow_html=True)
+        min_neighbours = st.number_input("Neighbour support / 9", 2, 9, DEFAULTS["min_neighbours"], 1, key="min_neighbours")
+    st.markdown(f'<div class="card-caption">Minimum connected area ≈ {int(min_pixels) * RESOLUTION * RESOLUTION:,} m² at {RESOLUTION} m. Defaults are conservative to suppress tiny scattered regions.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with process_col:
@@ -568,25 +563,27 @@ with process_col:
                 progress.progress(20, text="Searching reference window…")
                 references = get_references(target, st.session_state.aoi, reference_days, max_cloud)
                 if not references:
-                    raise RuntimeError("No same-tile references found. Increase the reference window or cloud limit.")
+                    raise RuntimeError("No reference scenes found. Increase the reference window or cloud limit.")
                 scored, rows = [], []
-                for i, reference in enumerate(references, 1):
-                    progress.progress(20 + int(45 * i / max(1, len(references))), text=f"Downloading reference {i}/{len(references)}…")
+                for index, reference in enumerate(references, 1):
+                    progress.progress(20 + int(45 * index / max(1, len(references))), text=f"Downloading reference {index}/{len(references)}…")
                     path = download_scene(reference, st.session_state.aoi, token)
                     bands, _ = read_stack(path)
                     score, c4, c11, c12, count, mode = reference_score(target_bands, bands)
-                    rows.append({"id": as_dict(reference).get("id"), "date": get_datetime(reference), "tile": get_tile(reference), "cloud": get_cloud(reference), "score": score, "b4": c4, "b11": c11, "b12": c12, "valid_pixels": count, "score_mode": mode})
+                    rows.append({"id": as_dict(reference).get("id"), "date": get_datetime(reference), "tile": get_tile(reference), "cloud": get_cloud(reference), "score": score, "b4_corr": c4, "b11_corr": c11, "b12_corr": c12, "finite_pixels": count, "score_mode": mode})
                     if np.isfinite(score):
                         scored.append((score, reference, bands))
-                st.session_state.reference_table = pd.DataFrame(rows).sort_values("score", ascending=False, na_position="last")
+                reference_table = pd.DataFrame(rows).sort_values("score", ascending=False, na_position="last")
+                st.session_state.reference_table = reference_table
                 if not scored:
-                    diagnostics = st.session_state.reference_table[["date", "cloud", "valid_pixels", "score_mode"]].to_string(index=False) if not st.session_state.reference_table.empty else "No rows"
-                    raise RuntimeError(f"No reference could be scored. Diagnostic table:\n{diagnostics}")
-                scored.sort(key=lambda x: x[0], reverse=True)
-                selected_refs = [x for x in scored if x[0] >= DEFAULTS["min_reference_score"]][:DEFAULTS["max_reference_count"]] or scored[:3]
-                reference_stack = {band: np.nanmedian(np.stack([x[2][band] for x in selected_refs]), axis=0).astype(np.float32) for band in OUTPUT_BANDS}
-                progress.progress(75, text="Running coherent anomaly detection…")
-                params = {"threshold_sigma": float(threshold_sigma), "local_threshold": float(local_threshold), "local_radius": DEFAULTS["local_sigma"], "min_component_pixels": int(min_pixels), "min_neighbours": int(min_neighbours), "gaussian_sigma": DEFAULTS["gaussian_sigma"], "quality_dilation": DEFAULTS["quality_dilation"]}
+                    raise RuntimeError("No reference could be scored. Check the downloaded band values and the reference CSV.")
+                scored.sort(key=lambda item: item[0], reverse=True)
+                selected_refs = [item for item in scored if item[0] >= DEFAULTS["min_reference_score"]][:DEFAULTS["max_reference_count"]]
+                if not selected_refs:
+                    selected_refs = scored[: min(3, len(scored))]
+                reference_stack = {band: np.nanmedian(np.stack([item[2][band] for item in selected_refs]), axis=0).astype(np.float32) for band in OUTPUT_BANDS}
+                progress.progress(75, text="Running conservative anomaly detection…")
+                params = {"scene_threshold": float(scene_threshold), "local_threshold": float(local_threshold), "local_radius": DEFAULTS["local_radius"], "min_component_pixels": int(min_pixels), "min_neighbours": int(min_neighbours), "gaussian_sigma": DEFAULTS["gaussian_sigma"], "quality_dilation": DEFAULTS["quality_dilation"]}
                 result = calculate_anomaly(target_bands, reference_stack, params)
                 result["reference_count"] = len(selected_refs)
                 result["reference_best_score"] = float(selected_refs[0][0])
@@ -629,7 +626,7 @@ if "result" in st.session_state:
             st.image(st.session_state.pngs[key], use_container_width=True)
             st.markdown(legend_html(kind), unsafe_allow_html=True)
             st.download_button("⬇ Download GeoTIFF", st.session_state.paths[key].read_bytes(), file_name=st.session_state.paths[key].name, mime="image/tiff", key=f"download_{key}", use_container_width=True)
-    st.markdown('<div class="card-caption">Validity means usable quality pixels, not methane presence. Raw candidates are spectral anomalies; coherent and final candidates additionally pass spatial filters.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">Validity means usable quality pixels, not methane presence. Raw candidates are spectral anomalies; coherent and final candidates pass spatial filters. This is a screening output, not a physical methane concentration.</div>', unsafe_allow_html=True)
     if "reference_table" in st.session_state:
-        st.download_button("⬇ Download reference-selection CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection_v4.csv", mime="text/csv", use_container_width=True)
+        st.download_button("⬇ Download reference-selection CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection_final.csv", mime="text/csv", use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
