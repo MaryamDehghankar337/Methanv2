@@ -6,6 +6,7 @@ MBMC-faithful v3 (final)
   • Robust reference selection with fallback
   • 30-day time-series + visual daily playback
   • Sentinel-5P CH4 with forced AOI-center display
+  • Location search (Nominatim) + jump-to-location + coordinates panel
 
 UI/design preserved from the original version.
 Algorithm engine re-implemented following the MBMC paper,
@@ -31,7 +32,7 @@ import rasterio
 import rasterio.transform
 from rasterio.warp import transform as rio_transform
 import streamlit as st
-from folium.plugins import Draw
+from folium.plugins import Draw, MousePosition
 from scipy.ndimage import (
     binary_dilation,
     binary_opening,
@@ -70,7 +71,7 @@ K_MBMP = 1.0e-5
 DETREND_SIGMA = 150.0
 ABS_FLOOR_PPB = 20.0
 N_SIGMA = 2.5
-GAUSS_SIGMA = 3.0          # ← تغییر ۱: از 1.5 به 3.0
+GAUSS_SIGMA = 3.0
 FLOOD_MIN_SIZE = 10
 DILATE_RADIUS_FINAL = 3
 
@@ -171,6 +172,26 @@ def normalize_geometry(obj):
 
 def ensure_aoi(obj):
     return normalize_geometry(obj) or mapping(DEFAULT_AOI)
+
+
+def geocode_location(query: str):
+    """Geocode a location name using Nominatim (OpenStreetMap).
+    Returns (lat, lon, display_name) or None."""
+    try:
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 1, "addressdetails": 0},
+            headers={"User-Agent": "SentinelMethaneScreeningApp/1.0"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        results = response.json()
+        if results:
+            first = results[0]
+            return float(first["lat"]), float(first["lon"]), first.get("display_name", query)
+    except Exception:
+        pass
+    return None
 
 
 def search_scenes(aoi, start, end, max_cloud):
@@ -460,7 +481,7 @@ def normalized_gaussian(data, valid_mask, sigma):
     return output.astype(np.float32)
 
 
-def make_spatial_mask(shape, profile, lat=SITE_LAT, lon=SITE_LON, radius_m=SITE_RADIUS_M):
+def make_spatial_mask(shape_, profile, lat=SITE_LAT, lon=SITE_LON, radius_m=SITE_RADIUS_M):
     transform = profile["transform"]
     crs = profile["crs"]
     try:
@@ -469,9 +490,9 @@ def make_spatial_mask(shape, profile, lat=SITE_LAT, lon=SITE_LON, radius_m=SITE_
         xs, ys = [lon], [lat]
     row, col = rasterio.transform.rowcol(transform, xs[0], ys[0])
     row = int(row); col = int(col)
-    h, w = shape
+    h, w = shape_
     if not (0 <= row < h and 0 <= col < w):
-        return np.ones(shape, dtype=bool), (row, col)
+        return np.ones(shape_, dtype=bool), (row, col)
     rows, cols = np.ogrid[:h, :w]
     px = abs(transform.a)
     py = abs(transform.e)
@@ -577,11 +598,53 @@ def save_raster(path, array, profile, mask=False):
         destination.write(output, 1)
 
 
-def create_map(aoi):
+def create_map(aoi, search_center=None, search_zoom=11):
     geometry = shape(ensure_aoi(aoi))
-    fmap = folium.Map([geometry.centroid.y, geometry.centroid.x], zoom_start=11, tiles="OpenStreetMap")
-    folium.GeoJson(mapping(geometry), style_function=lambda _: {"color": "blue", "fill": False}).add_to(fmap)
-    Draw(export=True, draw_options={"polyline": False, "circle": False, "marker": False, "circlemarker": False}).add_to(fmap)
+    if search_center:
+        center = [float(search_center[0]), float(search_center[1])]
+        zoom = int(search_zoom)
+    else:
+        center = [geometry.centroid.y, geometry.centroid.x]
+        zoom = 11
+
+    fmap = folium.Map(center, zoom_start=zoom, tiles="OpenStreetMap")
+    folium.GeoJson(
+        mapping(geometry),
+        style_function=lambda _: {"color": "blue", "fill": False},
+    ).add_to(fmap)
+
+    if search_center:
+        folium.Marker(
+            [float(search_center[0]), float(search_center[1])],
+            popup=folium.Popup(
+                f"<b>Searched location</b><br>"
+                f"Lat: {float(search_center[0]):.5f}<br>"
+                f"Lon: {float(search_center[1]):.5f}",
+                max_width=260,
+            ),
+            tooltip="Searched location",
+        ).add_to(fmap)
+
+    Draw(
+        export=True,
+        draw_options={
+            "polyline": False,
+            "circle": False,
+            "marker": False,
+            "circlemarker": False,
+        },
+    ).add_to(fmap)
+
+    try:
+        MousePosition(
+            position="bottomright",
+            separator=" | ",
+            prefix="Lat/Lon:",
+            num_digits=5,
+        ).add_to(fmap)
+    except Exception:
+        pass
+
     return fmap
 
 
@@ -711,7 +774,6 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
         if best_ref_bands is None:
             return None
         result = run_algorithm(target_bands, best_ref_bands, target_profile)
-        # ← تغییر ۲: mean/max/std از detrended محاسبه می‌شن
         row = {
             "date": target_date,
             "mean_mbmp": float(np.nanmean(result["detrended"])),
@@ -794,6 +856,10 @@ div[data-testid="stDataFrame"] * { color: #111111 !important; }
 .result-legend .legend-row { display: flex; align-items: center; gap: 0.45rem; color: #111111 !important; font-size: 0.82rem; line-height: 1.25; }
 .result-legend .legend-row span:last-child { color: #111111 !important; }
 .legend-swatch { width: 18px; height: 14px; min-width: 18px; border: 1px solid #555; border-radius: 2px; display: inline-block; }
+.coords-panel { margin-top: 0.55rem; background: #f8fbfb; border: 1px solid #d7e4e7; border-radius: 10px; padding: 0.5rem 0.7rem; display: flex; flex-direction: column; gap: 0.3rem; }
+.coord-row { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; font-size: 0.78rem; color: #111111 !important; }
+.coord-label { font-weight: 700; color: #111111 !important; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.coord-value { flex: 0 0 auto; font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; background: #eef5f6; border: 1px solid #cfe0e3; border-radius: 6px; padding: 0.12rem 0.5rem; color: #111111 !important; font-size: 0.74rem; white-space: nowrap; }
 footer { visibility: hidden; }
 .stMarkdown { margin-bottom: 0.1rem; }
 .element-container { margin-bottom: 0.15rem; }
@@ -818,12 +884,110 @@ with map_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">01 · STUDY AREA</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-title">Area of Interest</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">Draw or edit the study area directly on the map.</div>', unsafe_allow_html=True)
-    map_data = st_folium(create_map(st.session_state.aoi), height=385, width=1000, key="aoi_map")
+    st.markdown(
+        '<div class="card-caption">Search a location or draw the study area directly on the map.</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Location search row ──────────────────────────────────────────
+    search_col1, search_col2 = st.columns([4, 1], gap="small")
+    with search_col1:
+        search_query = st.text_input(
+            "Location search",
+            placeholder="🔎  Search a place  (e.g. Tehran, Aradkouh landfill, Paris, …)",
+            key="location_search_input",
+            label_visibility="collapsed",
+        )
+    with search_col2:
+        search_clicked = st.button("🔍 Find", use_container_width=True, key="search_location_btn")
+
+    if search_clicked:
+        query = (search_query or "").strip()
+        if not query:
+            st.warning("Please type a location name first.")
+        else:
+            with st.spinner("Searching location…"):
+                geo = geocode_location(query)
+            if geo:
+                st.session_state["search_center"] = [geo[0], geo[1]]
+                st.session_state["search_name"] = geo[2]
+                st.session_state["search_zoom"] = 12
+            else:
+                st.warning("Location not found. Try a different name or spelling.")
+
+    if st.session_state.get("search_center"):
+        info_col, clear_col = st.columns([4, 1], gap="small")
+        with info_col:
+            st.markdown(
+                f'<div class="card-caption" style="margin-top:0.35rem;">'
+                f'📌 {st.session_state.get("search_name", "Searched location")}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with clear_col:
+            if st.button("✖ Clear", use_container_width=True, key="clear_search_btn"):
+                st.session_state.pop("search_center", None)
+                st.session_state.pop("search_name", None)
+                st.rerun()
+
+    # ── Map ──────────────────────────────────────────────────────────
+    map_center = st.session_state.get("search_center")
+    map_zoom = st.session_state.get("search_zoom", 11)
+    map_data = st_folium(
+        create_map(st.session_state.aoi, search_center=map_center, search_zoom=map_zoom),
+        height=385,
+        width=1000,
+        key="aoi_map",
+    )
     if map_data and map_data.get("all_drawings"):
-        new_aoi = normalize_geometry({"type": "FeatureCollection", "features": map_data["all_drawings"]})
+        new_aoi = normalize_geometry(
+            {"type": "FeatureCollection", "features": map_data["all_drawings"]}
+        )
         if new_aoi:
             st.session_state.aoi = new_aoi
+
+    # ── Coordinates panel at the bottom ──────────────────────────────
+    coord_lines = []
+    aoi_geom = shape(ensure_aoi(st.session_state.aoi))
+    aoi_c = aoi_geom.centroid
+    coord_lines.append(
+        f'<div class="coord-row">'
+        f'<span class="coord-label">🎯 AOI center</span>'
+        f'<span class="coord-value">Lat {aoi_c.y:.5f} · Lon {aoi_c.x:.5f}</span>'
+        f'</div>'
+    )
+
+    if st.session_state.get("search_center"):
+        sc = st.session_state["search_center"]
+        sname = st.session_state.get("search_name", "Searched location")
+        short_name = (sname[:70] + "…") if len(sname) > 70 else sname
+        coord_lines.append(
+            f'<div class="coord-row">'
+            f'<span class="coord-label">📍 {short_name}</span>'
+            f'<span class="coord-value">Lat {sc[0]:.5f} · Lon {sc[1]:.5f}</span>'
+            f'</div>'
+        )
+
+    if map_data and map_data.get("last_clicked"):
+        lc = map_data["last_clicked"]
+        coord_lines.append(
+            f'<div class="coord-row">'
+            f'<span class="coord-label">🖱️ Last click on map</span>'
+            f'<span class="coord-value">Lat {lc["lat"]:.5f} · Lon {lc["lng"]:.5f}</span>'
+            f'</div>'
+        )
+
+    coord_lines.append(
+        '<div class="coord-row"><span class="coord-label" style="opacity:0.65;font-weight:500;">'
+        'Live mouse position shown on the map (bottom-right corner).</span>'
+        '<span class="coord-value" style="opacity:0.65;">—</span></div>'
+    )
+
+    st.markdown(
+        '<div class="coords-panel">' + "".join(coord_lines) + "</div>",
+        unsafe_allow_html=True,
+    )
+
     st.markdown('</div>', unsafe_allow_html=True)
 
 with control_col:
@@ -1166,7 +1330,6 @@ if "result" in st.session_state:
     metrics[4].metric("Regions", result["regions"])
     metrics[5].metric("Threshold", f"{result['threshold']:.2f}")
 
-    # ← تغییر ۳: پنل‌های بالا حالا detrended اول، و valid آخر
     result_items = [
         ("detrended", "ΔΩ after detrend (ppb)", "Detrended"),
         ("gaussian", "Gaussian smoothed", "Smoothed"),
