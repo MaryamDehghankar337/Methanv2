@@ -73,7 +73,9 @@ N_SIGMA = 1.75              # ← کاهش از 2.5 (سیگنال ضعیف)
 GAUSS_SIGMA = 10.0          # ← افزایش از 3.0 (سرکوب نویز ۲۰ متری S2)
 FLOOD_MIN_SIZE = 10
 DILATE_RADIUS_FINAL = 3
-SIGMA_WARN_PPB = 50.0       # آستانهٔ هشدار QA — σ بالاتر = reference ناسالم
+SIGMA_WARN_PPB = 50.0       # QA warning threshold
+REFERENCE_CORR_MIN = 0.70    # MBMC paper: Red/B04 correlation QC
+REFERENCE_WINDOW_DEFAULT = 30
 
 PARAMS = {
     "b03_quantile": 0.05,
@@ -177,7 +179,7 @@ def ensure_aoi(obj):
 
 def search_scenes(aoi, start, end, max_cloud):
     payload = {
-        "collections": ["sentinel-2-l2a"],
+        "collections": ["sentinel-2-l1c"],
         "datetime": f"{start.isoformat()}Z/{end.isoformat()}Z",
         "intersects": ensure_aoi(aoi),
         "query": {"eo:cloud_cover": {"lt": float(max_cloud)}},
@@ -285,7 +287,7 @@ function setup() {
   };
 }
 function evaluatePixel(sample) {
-  return [sample.CH4, 1.0];
+  return [sample.CH4, sample.dataMask];
 }
 """
 
@@ -293,7 +295,7 @@ function evaluatePixel(sample) {
 def download_scene(item, aoi, access_token):
     item = as_dict(item)
     aoi = ensure_aoi(aoi)
-    cache_id = hashlib.sha256(json.dumps([item.get("id"), aoi, RESOLUTION], sort_keys=True).encode()).hexdigest()[:24]
+    cache_id = hashlib.sha256(json.dumps(["s2_l1c_v5", item.get("id"), aoi, RESOLUTION], sort_keys=True).encode()).hexdigest()[:24]
     folder = CACHE_DIR / cache_id
     output_path = folder / "bands.tif"
     metadata_path = folder / "metadata.json"
@@ -310,7 +312,7 @@ def download_scene(item, aoi, access_token):
     payload = {
         "input": {
             "bounds": {"bbox": [minx, miny, maxx, maxy], "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}},
-            "data": [{"type": "sentinel-2-l2a", "dataFilter": {"timeRange": {"from": acquisition.strftime("%Y-%m-%dT00:00:00Z"), "to": (acquisition + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")}, "mosaickingOrder": "leastCC"}}],
+            "data": [{"type": "sentinel-2-l1c", "dataFilter": {"timeRange": {"from": acquisition.strftime("%Y-%m-%dT00:00:00Z"), "to": (acquisition + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")}, "mosaickingOrder": "leastCC"}}],
         },
         "output": {"width": width, "height": height, "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}]},
         "evalscript": evalscript(),
@@ -327,15 +329,25 @@ def download_scene(item, aoi, access_token):
     return output_path
 
 
-def download_s5p_scene(aoi, date_from, date_to, access_token):
+def download_s5p_scene(aoi, date_from, date_to, access_token, min_qa=50):
+    """Download quality-filtered Sentinel-5P CH4 for the requested time window.
+
+    The returned GeoTIFF contains two bands:
+      1) CH4 in ppb
+      2) dataMask (1=data, 0=no-data)
+
+    minQa is applied by the Sentinel Hub/CDSE Process API. For a same-day
+    validation run, date_from and date_to should be the same calendar date.
+    """
     aoi = ensure_aoi(aoi)
     cache_id = hashlib.sha256(
-        json.dumps(["s5p_ch4_v3", aoi, str(date_from), str(date_to)], sort_keys=True).encode()
+        json.dumps(["s5p_ch4_v5", aoi, str(date_from), str(date_to), int(min_qa)], sort_keys=True).encode()
     ).hexdigest()[:24]
     folder = CACHE_DIR / f"s5p_{cache_id}"
     output_path = folder / "ch4.tif"
     if output_path.exists():
         return output_path
+
     folder.mkdir(parents=True, exist_ok=True)
     minx, miny, maxx, maxy = shape(aoi).bounds
     payload = {
@@ -352,9 +364,12 @@ def download_s5p_scene(aoi, date_from, date_to, access_token):
                         "to": date_to.strftime("%Y-%m-%dT23:59:59Z"),
                     },
                 },
+                "processing": {"minQa": int(min_qa)},
             }],
         },
         "output": {
+            # This is only the requested output grid. It is NOT the native
+            # TROPOMI footprint; the latter remains several kilometres.
             "width": 256,
             "height": 256,
             "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}],
@@ -409,8 +424,9 @@ def evaluate_reference(target_bands, reference_bands, min_pixels):
     """Multi-band reference quality assessment.
 
     Returns (combined_score, corr_b04, corr_b11, corr_b12, valid_count).
-    Combined score weights the methane-relevant SWIR bands (B11, B12)
-    more heavily than B04, since ΔR is computed in the SWIR.
+    The SWIR-weighted score is retained as a diagnostic only.
+    For the actual MBMC-faithful reference selection, B04/Red correlation
+    is used as the quality-control and ranking criterion (>= 0.70).
     """
     valid = (
         np.isfinite(target_bands["B04"]) & np.isfinite(reference_bands["B04"]) &
@@ -553,14 +569,26 @@ def _robust_stats(values):
 
 
 def run_algorithm(target, reference, profile):
+    # MBMC LRAD is applied to both passes. Using the intersection prevents
+    # a surface artifact present only in the reference pass from entering
+    # the target-reference differential signal.
     target_q = float(np.nanquantile(target["B03"], PARAMS["b03_quantile"]))
-    valid = calculate_lrad(target, target_q)
-    if valid.sum() < 100:
-        raise RuntimeError("LRAD removed nearly all pixels. Relax thresholds or enlarge AOI.")
+    reference_q = float(np.nanquantile(reference["B03"], PARAMS["b03_quantile"]))
+    valid_target = calculate_lrad(target, target_q)
+    valid_reference = calculate_lrad(reference, reference_q)
+    valid = valid_target & valid_reference
 
-    c = calculate_c(target["B11"], target["B12"], valid)
-    dR_t = calculate_delta_R(target["B11"], target["B12"], c, valid)
-    dR_r = calculate_delta_R(reference["B11"], reference["B12"], c, valid)
+    if valid.sum() < 100:
+        raise RuntimeError("LRAD removed nearly all common target/reference pixels. Relax thresholds or enlarge AOI.")
+
+    # IMPORTANT: normalization coefficients are estimated independently for
+    # the target and reference passes. A shared coefficient can convert
+    # ordinary radiometric differences into a false differential signal.
+    c_target = calculate_c(target["B11"], target["B12"], valid_target)
+    c_reference = calculate_c(reference["B11"], reference["B12"], valid_reference)
+
+    dR_t = calculate_delta_R(target["B11"], target["B12"], c_target, valid)
+    dR_r = calculate_delta_R(reference["B11"], reference["B12"], c_reference, valid)
 
     dOmega_t = dR_t / K_MBMP
     dOmega_r = dR_r / K_MBMP
@@ -588,6 +616,8 @@ def run_algorithm(target, reference, profile):
     structure = np.ones((3, 3), dtype=np.uint8)
     labeled, n_labels = label(candidate, structure=structure)
     plume = np.zeros_like(candidate, dtype=bool)
+    kept_region_count = 0
+
     if n_labels > 0:
         sizes = np.bincount(labeled.ravel(), minlength=n_labels + 1)
         sizes[0] = 0
@@ -595,6 +625,7 @@ def run_algorithm(target, reference, profile):
         if sizes_kept.max() > 0:
             order = np.argsort(sizes_kept)[::-1]
             order = order[order != 0]
+            kept_region_count = int(len(order))
             best_label = int(order[0])
             best_size = int(sizes_kept[best_label])
             if best_size < 30 and len(order) >= 2:
@@ -615,17 +646,21 @@ def run_algorithm(target, reference, profile):
         "detrended": dOmega_detrended,
         "gaussian": d_smooth,
         "valid": valid,
+        "valid_target": valid_target,
+        "valid_reference": valid_reference,
         "spatial_mask": spatial_mask,
         "initial": candidate,
         "final": plume,
         "mean": median,
         "std": sigma_robust,
         "threshold": threshold,
-        "regions": int(1 if plume.any() else 0),
+        "regions": int(kept_region_count),
         "valid_count": int(valid.sum()),
         "initial_count": int(candidate.sum()),
         "final_count": int(plume.sum()),
-        "c": float(c),
+        "c": float(c_target),
+        "c_target": float(c_target),
+        "c_reference": float(c_reference),
         "site_rc": site_rc,
     }
 
@@ -744,7 +779,8 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
         candidates = same_tile if same_tile else reference_scenes
 
         best_ref_bands = None
-        best_score = -np.inf
+        best_reference_b04 = -np.inf
+        best_score = np.nan
         best_b4 = np.nan
         best_valid = 0
 
@@ -753,19 +789,17 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
                 ref_bands, _ = read_stack(download_scene(ref, aoi, access_token))
             except Exception:
                 continue
-            combined, corr_b04, _, _, valid_count = evaluate_reference(
+            combined, corr_b04, corr_b11, corr_b12, valid_count = evaluate_reference(
                 target_bands, ref_bands, PARAMS["min_valid_ref_pixels"]
             )
-            if np.isfinite(combined) and combined > best_score:
+            # MBMC-faithful choice: first enforce the B04 correlation QC,
+            # then select the highest B04 correlation. SWIR score remains diagnostic.
+            if np.isfinite(corr_b04) and corr_b04 >= REFERENCE_CORR_MIN and corr_b04 > best_reference_b04:
+                best_reference_b04 = corr_b04
+                best_ref_bands = ref_bands
+                best_b4 = corr_b04
                 best_score = combined
-                best_ref_bands = ref_bands
-                best_b4 = corr_b04
                 best_valid = valid_count
-            elif best_ref_bands is None and valid_count > best_valid:
-                best_ref_bands = ref_bands
-                best_valid = valid_count
-                best_score = np.nan
-                best_b4 = corr_b04
 
         if best_ref_bands is None:
             return None
@@ -781,6 +815,8 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
             "regions": int(result["regions"]),
             "ref_score": float(best_score) if np.isfinite(best_score) else np.nan,
             "b4_correlation": float(best_b4) if np.isfinite(best_b4) else np.nan,
+            "c_target": float(result["c_target"]),
+            "c_reference": float(result["c_reference"]),
         }
         if store_image:
             row["png_relative"] = image_png(result["detrended"])
@@ -867,7 +903,7 @@ st.markdown("""
         <div class="app-title">🛰️ Sentinel-2 Methane Screening</div>
         <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC-faithful ΔΩ (ppb) candidate detection</div>
     </div>
-    <div class="status-pill">20 m processing &nbsp;•&nbsp; Multi-band reference scoring</div>
+    <div class="status-pill">20 m processing &nbsp;•&nbsp; Red-band reference QC + SWIR diagnostics</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -902,7 +938,7 @@ with control_col:
     with s1:
         max_cloud = st.slider("Cloud cover (%)", 0.0, 100.0, 30.0, key="max_cloud")
     with s2:
-        reference_days = st.slider("Reference window (days)", 1, 90, 15, key="reference_days")
+        reference_days = st.slider("Reference window (days)", 1, 90, REFERENCE_WINDOW_DEFAULT, key="reference_days")
 
     if st.button("🔎  Search Sentinel-2 scenes", type="primary", use_container_width=True):
         try:
@@ -1070,8 +1106,20 @@ with action_col:
                     target_tile = get_tile(target)
                     if target_date is None:
                         raise RuntimeError("The selected target scene has no valid acquisition date.")
+                    # The visible search table is not used as the complete reference pool.
+                    # We query CDSE again around the selected target so that the requested
+                    # ±reference_days window is actually respected even when the UI date
+                    # range is shorter than that window.
+                    reference_search_start = target_date - timedelta(days=int(reference_days))
+                    reference_search_end = target_date + timedelta(days=int(reference_days))
+                    reference_pool = search_scenes(
+                        st.session_state.aoi,
+                        reference_search_start,
+                        reference_search_end,
+                        max_cloud,
+                    )
                     all_candidates = [
-                        scene for scene in scene_results
+                        scene for scene in reference_pool
                         if as_dict(scene).get("id") != as_dict(target).get("id")
                         and get_datetime(scene) is not None
                         and abs((get_datetime(scene) - target_date).total_seconds()) / 86400 <= reference_days
@@ -1086,8 +1134,8 @@ with action_col:
                     target_bands, profile = read_stack(download_scene(target, st.session_state.aoi, access_token))
 
                     best_reference = None
-                    best_score = -np.inf
-                    best_b4 = np.nan
+                    best_score = np.nan
+                    best_b4 = -np.inf
                     best_valid = 0
                     reference_rows = []
                     total_refs = max(1, len(references))
@@ -1126,19 +1174,23 @@ with action_col:
                             "b11_correlation": corr_b11,
                             "b12_correlation": corr_b12,
                             "valid_pixels": valid_count,
-                            "status": "ok" if np.isfinite(combined) else "low-validity",
+                            "status": (
+                                "selected" if np.isfinite(corr_b04) and corr_b04 >= REFERENCE_CORR_MIN
+                                else "below B04 QC"
+                            ) if np.isfinite(valid_count) else "low-validity",
                         })
 
-                        if np.isfinite(combined) and combined > best_score:
+                        # MBMC paper selection rule: B04/Red correlation >= 0.70
+                        # forms the candidate pool; highest B04 correlation wins.
+                        if (
+                            np.isfinite(corr_b04)
+                            and corr_b04 >= REFERENCE_CORR_MIN
+                            and corr_b04 > best_b4
+                        ):
                             best_score = combined
                             best_reference = reference_bands
                             best_b4 = corr_b04
                             best_valid = valid_count
-                        elif best_reference is None and valid_count > best_valid:
-                            best_valid = valid_count
-                            best_reference = reference_bands
-                            best_score = np.nan
-                            best_b4 = corr_b04
 
                     st.session_state.reference_table = pd.DataFrame(reference_rows)
 
@@ -1154,7 +1206,8 @@ with action_col:
                             f"1. Increase the **date range** (make start date earlier).\n"
                             f"2. Increase the **cloud cover** threshold to 50–70%.\n"
                             f"3. Increase **Reference window (days)** to 30–60.\n"
-                            f"4. Enlarge the AOI on the map (at least ~30×30 km)."
+                            f"4. Set Reference window to 30 days (or larger)."
+                            f"\n5. A valid reference must satisfy B04/Red correlation ≥ {REFERENCE_CORR_MIN:.2f}."
                         )
                         st.stop()
 
@@ -1163,6 +1216,7 @@ with action_col:
                     result = run_algorithm(target_bands, best_reference, profile)
                     result["b4_correlation"] = float(best_b4) if np.isfinite(best_b4) else float("nan")
                     result["combined_score"] = float(best_score) if np.isfinite(best_score) else float("nan")
+                    result["reference_qc_threshold"] = REFERENCE_CORR_MIN
                     result["date"] = target_date.strftime("%Y-%m-%d")
 
                     signal_ratio = result["final_count"] / max(1, result["valid_count"])
@@ -1364,7 +1418,7 @@ if "result" in st.session_state:
         if not ts.empty and "mean_mbmp" in ts.columns:
             chart_df = ts.dropna(subset=["mean_mbmp"]).set_index("date")[["mean_mbmp", "max_mbmp"]]
             if not chart_df.empty:
-                st.markdown('<div class="card-caption">Daily detrended ΔΩ (ppb) statistics in the AOI</div>', unsafe_allow_html=True)
+                st.markdown('<div class="card-caption">Daily detrended ΔΩ (ppb) statistics in the AOI · reference QC B04 ≥ 0.70</div>', unsafe_allow_html=True)
                 st.line_chart(chart_df, use_container_width=True, height=240)
                 st.dataframe(
                     ts,
@@ -1418,13 +1472,13 @@ if "result" in st.session_state:
 
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). All pixels are shown (no QA filtering). Visualization is <b>anomaly relative to the local mean</b>.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). QA filter: minQa = 50%. For validation, use 0 days so the S5P observation is restricted to the target date. Visualization is <b>anomaly relative to the valid-pixel mean</b>.</div>', unsafe_allow_html=True)
 
     s5p_col1, s5p_col2 = st.columns([1, 3], gap="small")
     with s5p_col1:
         run_s5p = st.button("🛰️  Fetch S5P CH4", type="primary", use_container_width=True, key="s5p_button", disabled=not bool(st.session_state.get("cdse_auth")))
     with s5p_col2:
-        s5p_days = st.slider("S5P temporal window (days around target)", 1, 30, 15, key="s5p_days")
+        s5p_days = st.slider("S5P temporal window (days around target)", 0, 30, 0, key="s5p_days")
 
     if run_s5p:
         try:
@@ -1441,10 +1495,12 @@ if "result" in st.session_state:
                 )
             with rasterio.open(s5p_path) as src:
                 ch4 = src.read(1).astype(np.float32)
+                s5p_mask = src.read(2).astype(np.float32) if src.count >= 2 else np.ones_like(ch4, dtype=np.float32)
             ch4[~np.isfinite(ch4)] = np.nan
-            ch4[ch4 <= 0] = np.nan
+            ch4[(s5p_mask < 0.5) | (ch4 <= 0)] = np.nan
             st.session_state.s5p_ch4 = ch4
-            st.success("S5P CH4 loaded")
+            st.session_state.s5p_mask = s5p_mask
+            st.success("S5P CH4 loaded with QA/dataMask filtering")
         except Exception as s5p_error:
             st.error(f"S5P fetch failed: {s5p_error}")
 
@@ -1457,9 +1513,10 @@ if "result" in st.session_state:
             ch4 = np.full_like(ch4, placeholder)
             valid_ch4 = ch4[np.isfinite(ch4)]
             st.warning(
-                "⚠️ Sentinel-5P returned no valid pixels for this AOI and time window "
-                "(cloud cover / QA). Showing the AOI center with a placeholder value. "
-                "Try increasing the temporal window to 30 days."
+                "⚠️ Sentinel-5P returned no valid QA-approved pixels for this AOI and time window. "
+                "No placeholder is shown because a fabricated CH4 value would invalidate the comparison. "
+                "If you are checking the same Sentinel-2 acquisition date, first keep the window at 0; "
+                "only widen it for contextual analysis."
             )
 
         if valid_ch4.size > 1:
@@ -1477,7 +1534,7 @@ if "result" in st.session_state:
             with leg_col:
                 st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
                 st.markdown(legend_html("s5p"), unsafe_allow_html=True)
-            st.markdown('<div class="card-caption">Each pixel is shown as deviation from the local mean (red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill may only occupy 1–2 pixels.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="card-caption">Only QA-approved S5P pixels are shown. The anomaly is relative to the valid-pixel mean; this is a regional atmospheric context, not a pixel-to-pixel validation of the 20 m Sentinel-2 plume.</div>', unsafe_allow_html=True)
         else:
             st.warning("Not enough valid S5P CH4 pixels even after fallback. Increase the temporal window to 30 days.")
 
