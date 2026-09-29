@@ -3,7 +3,7 @@
 MBMC-faithful v5 (cloud-aware, robust threshold, multi-datasource fix)
    SCL-based cloud & shadow masking via two-datasource evalscript
    Trimmed-std robust noise estimation (fat-tail safe)
-   Percentile-capped threshold (prevents runaway Ïƒ)
+   Percentile-capped threshold (prevents runaway σ)
    Location search (Nominatim) + jump-to-location + coordinates panel
    Aradkouh landfill (Tehran) as default AOI
    30-day time-series + visual daily playback
@@ -44,7 +44,7 @@ STAC_URL = "https://stac.dataspace.copernicus.eu/v1/"
 TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 
-# â”€â”€ SCL added to bands for cloud/shadow masking â”€â”€
+# ── SCL added to bands for cloud/shadow masking ──
 BANDS = ["B03", "B04", "B08", "B11", "B12", "SCL"]
 RESOLUTION = 20
 CACHE_DIR = Path.home() / ".sentinel_methane_cache"
@@ -60,7 +60,7 @@ SITE_LAT = 35.505
 SITE_LON = 51.330
 SITE_RADIUS_M = 5000.0
 
-# â”€â”€ Tuned MBMC constants â”€â”€
+# ── Tuned MBMC constants ──
 K_MBMP = 1.0e-5
 DETREND_SIGMA = 200.0
 ABS_FLOOR_PPB = 20.0
@@ -95,9 +95,9 @@ PARAMS = {
 }
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════
 #  HELPERS
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════
 
 def as_dict(item):
     if isinstance(item, dict):
@@ -277,7 +277,7 @@ def get_access_token():
     raise RuntimeError("Your Copernicus session expired. Please log in again.")
 
 
-# â”€â”€ FIX: two-datasource evalscript (reflectance + SCL) â”€â”€
+# ── FIX: two-datasource evalscript (reflectance + SCL) ──
 def evalscript():
     return """//VERSION=3
 function setup() {
@@ -329,7 +329,7 @@ def download_scene(item, aoi, access_token):
     if acquisition is None:
         raise RuntimeError("Could not read acquisition date.")
 
-    # â”€â”€ FIX: two data objects with distinct ids (refl + scl) â”€â”€
+    # ── FIX: two data objects with distinct ids (refl + scl) ──
     time_from = acquisition.strftime("%Y-%m-%dT00:00:00Z")
     time_to = (acquisition + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
     payload = {
@@ -441,9 +441,9 @@ def normalized_difference(first, second):
     return output
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════
 #  CORE ALGORITHM
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════
 
 def calculate_lrad(bands, q_value):
     finite = np.logical_and.reduce([
@@ -474,7 +474,7 @@ def calculate_lrad(bands, q_value):
 
 
 def calculate_c(b11, b12, valid):
-    """c = Î£(B11Â·B12) / Î£(B12Â²)."""
+    """c = Σ(B11·B12) / Σ(B12²)."""
     use = valid & np.isfinite(b11) & np.isfinite(b12) & (b11 > 0.05) & (b12 > 0.05)
     if use.sum() < 100:
         return 1.0
@@ -487,7 +487,7 @@ def calculate_c(b11, b12, valid):
 
 
 def calculate_delta_R(b11, b12, c, valid):
-    """Î”R = (cÂ·B12 âˆ’ B11) / B12."""
+    """ΔR = (c·B12 − B11) / B12."""
     output = np.full(b11.shape, np.nan, dtype=np.float32)
     use = (
         valid
@@ -809,9 +809,9 @@ def georeferenced_png_package(array, profile, mask=False):
     return package.getvalue()
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════
 #  TIME-SERIES
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════
 
 def process_single_day(target_scene, reference_scenes, aoi, access_token, store_image=True):
     try:
@@ -868,11 +868,11 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
         return {"date": get_datetime(target_scene), "error": str(exc)}
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════
 #  UI
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="Sentinel-2 Methane", page_icon="ðŸ›°ï¸", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Sentinel-2 Methane", page_icon="🛰️", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
 <style>
@@ -946,8 +946,8 @@ footer { visibility: hidden; }
 st.markdown("""
 <div class="app-header">
     <div>
-        <div class="app-title">ðŸ›°ï¸ Sentinel-2 Methane Screening</div>
-        <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC-faithful Î”Î© (ppb) candidate detection &nbsp;|&nbsp; v5 cloud-aware</div>
+        <div class="app-title">🛰️ Sentinel-2 Methane Screening</div>
+        <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC-faithful ΔΩ (ppb) candidate detection &nbsp;|&nbsp; v5 cloud-aware</div>
     </div>
     <div class="status-pill">20 m processing &nbsp;&nbsp; Light dashboard</div>
 </div>
@@ -959,7 +959,7 @@ if "aoi" not in st.session_state:
 map_col, control_col = st.columns([1.65, 1.0], gap="small")
 with map_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">01 Â· STUDY AREA</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">01 · STUDY AREA</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-title">Area of Interest</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="card-caption">Search a location or draw the study area directly on the map.</div>',
@@ -970,19 +970,19 @@ with map_col:
     with search_col1:
         search_query = st.text_input(
             "Location search",
-            placeholder="ðŸ”Ž  Search a place  (e.g. Tehran, Aradkouh landfill, Paris, ¦)",
+            placeholder="🔎  Search a place  (e.g. Tehran, Aradkouh landfill, Paris, …)",
             key="location_search_input",
             label_visibility="collapsed",
         )
     with search_col2:
-        search_clicked = st.button("ðŸ” Find", use_container_width=True, key="search_location_btn")
+        search_clicked = st.button("🔍 Find", use_container_width=True, key="search_location_btn")
 
     if search_clicked:
         query = (search_query or "").strip()
         if not query:
             st.warning("Please type a location name first.")
         else:
-            with st.spinner("Searching location¦"):
+            with st.spinner("Searching location…"):
                 geo = geocode_location(query)
             if geo:
                 st.session_state["search_center"] = [geo[0], geo[1]]
@@ -996,12 +996,12 @@ with map_col:
         with info_col:
             st.markdown(
                 f'<div class="card-caption" style="margin-top:0.35rem;">'
-                f'ðŸ“Œ {st.session_state.get("search_name", "Searched location")}'
+                f'📍 {st.session_state.get("search_name", "Searched location")}'
                 f'</div>',
                 unsafe_allow_html=True,
             )
         with clear_col:
-            if st.button("âœ– Clear", use_container_width=True, key="clear_search_btn"):
+            if st.button("✖ Clear", use_container_width=True, key="clear_search_btn"):
                 st.session_state.pop("search_center", None)
                 st.session_state.pop("search_name", None)
                 st.rerun()
@@ -1026,19 +1026,19 @@ with map_col:
     aoi_c = aoi_geom.centroid
     coord_lines.append(
         f'<div class="coord-row">'
-        f'<span class="coord-label">ðŸŽ¯ AOI center</span>'
-        f'<span class="coord-value">Lat {aoi_c.y:.5f} Â· Lon {aoi_c.x:.5f}</span>'
+        f'<span class="coord-label">🎯 AOI center</span>'
+        f'<span class="coord-value">Lat {aoi_c.y:.5f} · Lon {aoi_c.x:.5f}</span>'
         f'</div>'
     )
 
     if st.session_state.get("search_center"):
         sc = st.session_state["search_center"]
         sname = st.session_state.get("search_name", "Searched location")
-        short_name = (sname[:70] + "¦") if len(sname) > 70 else sname
+        short_name = (sname[:70] + "…") if len(sname) > 70 else sname
         coord_lines.append(
             f'<div class="coord-row">'
-            f'<span class="coord-label">ðŸ“ {short_name}</span>'
-            f'<span class="coord-value">Lat {sc[0]:.5f} Â· Lon {sc[1]:.5f}</span>'
+            f'<span class="coord-label">📍 {short_name}</span>'
+            f'<span class="coord-value">Lat {sc[0]:.5f} · Lon {sc[1]:.5f}</span>'
             f'</div>'
         )
 
@@ -1046,15 +1046,15 @@ with map_col:
         lc = map_data["last_clicked"]
         coord_lines.append(
             f'<div class="coord-row">'
-            f'<span class="coord-label">ðŸ–±ï¸ Last click on map</span>'
-            f'<span class="coord-value">Lat {lc["lat"]:.5f} Â· Lon {lc["lng"]:.5f}</span>'
+            f'<span class="coord-label">🖱️ Last click on map</span>'
+            f'<span class="coord-value">Lat {lc["lat"]:.5f} · Lon {lc["lng"]:.5f}</span>'
             f'</div>'
         )
 
     coord_lines.append(
         '<div class="coord-row"><span class="coord-label" style="opacity:0.65;font-weight:500;">'
         'Live mouse position shown on the map (bottom-right corner).</span>'
-        '<span class="coord-value" style="opacity:0.65;">”</span></div>'
+        '<span class="coord-value" style="opacity:0.65;">–</span></div>'
     )
 
     st.markdown(
@@ -1066,7 +1066,7 @@ with map_col:
 
 with control_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">02 Â· SEARCH</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">02 · SEARCH</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-title">Scene Search</div>', unsafe_allow_html=True)
     default_end = datetime.now().date()
     default_start = default_end - timedelta(days=30)
@@ -1081,7 +1081,7 @@ with control_col:
     with s2:
         reference_days = st.slider("Reference window (days)", 1, 90, 60, key="reference_days")
 
-    if st.button("ðŸ”Ž  Search Sentinel-2 scenes", type="primary", use_container_width=True):
+    if st.button("🔍  Search Sentinel-2 scenes", type="primary", use_container_width=True):
         try:
             with st.spinner("Searching CDSE STAC..."):
                 search_results = search_scenes(
@@ -1180,7 +1180,7 @@ st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
 settings_col, action_col = st.columns([1.65, 1.0], gap="small")
 with settings_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">03 Â· DETECTION</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">03 · DETECTION</div>', unsafe_allow_html=True)
     p1, p2, p3 = st.columns(3, gap="small")
     with p1:
         PARAMS["threshold_sigma"] = st.number_input("Threshold multiplier", min_value=0.1, max_value=6.0, value=float(PARAMS["threshold_sigma"]), step=0.1, key="threshold_sigma")
@@ -1189,16 +1189,16 @@ with settings_col:
     with p3:
         PARAMS["final_dilation"] = st.number_input("Final dilation radius", min_value=0, max_value=20, value=int(PARAMS["final_dilation"]), step=1, key="final_dilation")
     estimated_area_m2 = int(PARAMS["min_component_pixels"]) * RESOLUTION * RESOLUTION
-    st.markdown(f'<div class="card-caption">Minimum connected region â‰ˆ {estimated_area_m2:,} mÂ² at {RESOLUTION} m resolution.</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="card-caption">Minimum connected region ≈ {estimated_area_m2:,} m² at {RESOLUTION} m resolution.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with action_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">04 Â· PROCESS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">04 · PROCESS</div>', unsafe_allow_html=True)
     scene_results = st.session_state.get("scene_results", [])
     cdse_auth = st.session_state.get("cdse_auth")
     if cdse_auth:
-        st.markdown(f'<div class="auth-status">âœ“ Copernicus connected Â· {cdse_auth.get("username", "")}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="auth-status">✓ Copernicus connected · {cdse_auth.get("username", "")}</div>', unsafe_allow_html=True)
         logout_col, _ = st.columns([1, 2])
         with logout_col:
             if st.button("Log out", use_container_width=True, key="cdse_logout"):
@@ -1208,15 +1208,15 @@ with action_col:
         st.markdown('<div class="auth-card">', unsafe_allow_html=True)
         st.markdown('<div class="card-title">Copernicus login</div>', unsafe_allow_html=True)
         st.markdown('<div class="auth-help">Log in once in this browser session. Your password is sent directly to the official Copernicus identity service; the app keeps only the temporary API token.</div>', unsafe_allow_html=True)
-        st.link_button("ðŸŒ Open Copernicus website", "https://dataspace.copernicus.eu/", use_container_width=True)
+        st.link_button("🌐 Open Copernicus website", "https://dataspace.copernicus.eu/", use_container_width=True)
         with st.form("cdse_login_form", clear_on_submit=True):
             login_user = st.text_input("Copernicus email", placeholder="your-email@example.com")
             login_password = st.text_input("Copernicus password", type="password")
             login_totp = st.text_input("2FA code (optional)", max_chars=8, placeholder="Only if your account uses 2FA")
-            login_submitted = st.form_submit_button("ðŸ” Login & connect", type="primary", use_container_width=True)
+            login_submitted = st.form_submit_button("🔐 Login & connect", type="primary", use_container_width=True)
         if login_submitted:
             try:
-                with st.spinner("Connecting to Copernicus¦"):
+                with st.spinner("Connecting to Copernicus…"):
                     st.session_state.cdse_auth = authenticate_cdse(login_user, login_password, login_totp)
                 st.success("Copernicus login successful. You can now run the detection.")
                 st.rerun()
@@ -1230,16 +1230,16 @@ with action_col:
             target_date = get_datetime(target)
             target_tile = get_tile(target) or "Unknown tile"
             target_label = target_date.strftime("%Y-%m-%d") if target_date else "Unknown date"
-            st.markdown(f'<div class="card-title">Ready to detect</div><div class="card-caption">Target: {target_label} Â· {target_tile}</div>', unsafe_allow_html=True)
-            detect_clicked = st.button("ðŸ›°ï¸  Download AOI & Detect Methane", type="primary", use_container_width=True, key="detect_button", disabled=not bool(st.session_state.get("cdse_auth")))
+            st.markdown(f'<div class="card-title">Ready to detect</div><div class="card-caption">Target: {target_label} · {target_tile}</div>', unsafe_allow_html=True)
+            detect_clicked = st.button("🛰️  Download AOI & Detect Methane", type="primary", use_container_width=True, key="detect_button", disabled=not bool(st.session_state.get("cdse_auth")))
             if not st.session_state.get("cdse_auth"):
                 st.markdown('<div class="card-caption">Please connect your Copernicus account above before downloading Sentinel-2 data.</div>', unsafe_allow_html=True)
             if detect_clicked:
-                progress = st.progress(0, text="Preparing methane detection¦")
+                progress = st.progress(0, text="Preparing methane detection…")
                 progress_status = st.empty()
                 try:
-                    progress_status.markdown('<div class="card-caption">Step 1 of 5 Â· Connecting to CDSE and preparing the target scene¦</div>', unsafe_allow_html=True)
-                    progress.progress(8, text="Preparing target scene¦")
+                    progress_status.markdown('<div class="card-caption">Step 1 of 5 · Connecting to CDSE and preparing the target scene…</div>', unsafe_allow_html=True)
+                    progress.progress(8, text="Preparing target scene…")
                     access_token = get_access_token()
                     target = st.session_state["target"]
                     target_date = get_datetime(target)
@@ -1257,8 +1257,8 @@ with action_col:
                     if not references:
                         st.warning("No reference scene exists in the selected time window. Increase the date range or reference window.")
                         st.stop()
-                    progress_status.markdown('<div class="card-caption">Step 2 of 5 Â· Downloading target image bands and preparing the AOI¦</div>', unsafe_allow_html=True)
-                    progress.progress(25, text="Downloading target bands¦")
+                    progress_status.markdown('<div class="card-caption">Step 2 of 5 · Downloading target image bands and preparing the AOI…</div>', unsafe_allow_html=True)
+                    progress.progress(25, text="Downloading target bands…")
                     target_bands, profile = read_stack(download_scene(target, st.session_state.aoi, access_token))
 
                     best_reference = None
@@ -1269,8 +1269,8 @@ with action_col:
 
                     for ref_index, reference in enumerate(references, start=1):
                         pct = 30 + int(40 * (ref_index - 1) / total_refs)
-                        progress_status.markdown(f'<div class="card-caption">Step 3 of 5 Â· Downloading and comparing reference scene {ref_index} of {total_refs}¦</div>', unsafe_allow_html=True)
-                        progress.progress(pct, text=f"Reference scene {ref_index} of {total_refs}¦")
+                        progress_status.markdown(f'<div class="card-caption">Step 3 of 5 · Downloading and comparing reference scene {ref_index} of {total_refs}…</div>', unsafe_allow_html=True)
+                        progress.progress(pct, text=f"Reference scene {ref_index} of {total_refs}…")
 
                         try:
                             reference_bands, _ = read_stack(download_scene(reference, st.session_state.aoi, access_token))
@@ -1328,14 +1328,14 @@ with action_col:
                             f"- Target valid B4 pixels: **{target_valid:,}**\n\n"
                             f"**Suggestions:**\n"
                             f"1. Increase the **date range** (make start date earlier).\n"
-                            f"2. Increase the **cloud cover** threshold to 50“70%.\n"
+                            f"2. Increase the **cloud cover** threshold to 50–70%.\n"
                             f"3. Increase **Reference window (days)** to 90.\n"
-                            f"4. Enlarge the AOI on the map (at least ~30Ã—30 km)."
+                            f"4. Enlarge the AOI on the map (at least ~30×30 km)."
                         )
                         st.stop()
 
-                    progress_status.markdown('<div class="card-caption">Step 4 of 5 Â· Running MBMC Î”Î© (ppb) anomaly detection and candidate cleanup¦</div>', unsafe_allow_html=True)
-                    progress.progress(78, text="Running methane detection¦")
+                    progress_status.markdown('<div class="card-caption">Step 4 of 5 · Running MBMC ΔΩ (ppb) anomaly detection and candidate cleanup…</div>', unsafe_allow_html=True)
+                    progress.progress(78, text="Running methane detection…")
                     result = run_algorithm(target_bands, best_reference, profile)
                     result["b4_correlation"] = best_correlation if np.isfinite(best_correlation) else float("nan")
                     result["date"] = target_date.strftime("%Y-%m-%d")
@@ -1359,21 +1359,21 @@ with action_col:
                         "final": image_png(result["final"], mask=True),
                         "valid": image_png(result["valid"], mask=True),
                     }
-                    progress_status.markdown('<div class="card-caption">Step 5 of 5 Â· Saving georeferenced outputs and preparing downloads¦</div>', unsafe_allow_html=True)
-                    progress.progress(100, text="Ready to detect Â· outputs are ready")
+                    progress_status.markdown('<div class="card-caption">Step 5 of 5 · Saving georeferenced outputs and preparing downloads…</div>', unsafe_allow_html=True)
+                    progress.progress(100, text="Ready to detect · outputs are ready")
                     st.success("Processing completed")
 
                     if result["final_count"] == 0:
                         st.warning(
-                            f"âš ï¸ **No plume above threshold detected.** "
-                            f"Median Î”Î© = {result['mean']:.2f} ppb, robust Ïƒ = {result['std']:.2f} ppb, "
+                            f"⚠️ **No plume above threshold detected.** "
+                            f"Median ΔΩ = {result['mean']:.2f} ppb, robust σ = {result['std']:.2f} ppb, "
                             f"threshold = {result['threshold']:.2f} ppb. "
-                            f"Try lowering the Threshold multiplier to 1.5“2.0, or pick a different "
+                            f"Try lowering the Threshold multiplier to 1.5–2.0, or pick a different "
                             f"target/reference date pair."
                         )
                     elif signal_ratio < 0.00005:
                         st.warning(
-                            f"âš ï¸ **Very small final mask.** "
+                            f"⚠️ **Very small final mask.** "
                             f"The candidate mask covers only **{signal_ratio*100:.5f}%** of valid pixels "
                             f"({result['final_count']:,} / {result['valid_count']:,}). "
                             f"This may be a weak plume or residual noise."
@@ -1384,9 +1384,9 @@ with action_col:
         st.markdown('<div class="card-title">Select scenes first</div><div class="card-caption">Search for Sentinel-2 scenes, select a target, then run the detection.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════
 #  RESULTS
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════
 
 if "result" in st.session_state:
     result = st.session_state.result
@@ -1394,7 +1394,7 @@ if "result" in st.session_state:
     profile = st.session_state.get("output_profile")
     st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">05 Â· RESULTS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
     metrics = st.columns(6, gap="small")
     corr_text = f"{result['b4_correlation']:.3f}" if np.isfinite(result.get("b4_correlation", np.nan)) else "n/a"
     metrics[0].metric("B4 correlation", corr_text)
@@ -1406,21 +1406,21 @@ if "result" in st.session_state:
 
     diag = result.get("diagnostics", {})
     if diag:
-        with st.expander("ðŸ” Threshold & noise diagnostics", expanded=False):
+        with st.expander("🔍 Threshold & noise diagnostics", expanded=False):
             dcols = st.columns(4, gap="small")
             dcols[0].metric("Median (ppb)", f"{diag['median_ppb']:.2f}")
-            dcols[1].metric("Robust Ïƒ (ppb)", f"{diag['sigma_ppb']:.2f}")
-            dcols[2].metric("Ïƒ-threshold (ppb)", f"{diag['threshold_sigma_ppb']:.2f}")
+            dcols[1].metric("Robust σ (ppb)", f"{diag['sigma_ppb']:.2f}")
+            dcols[2].metric("σ-threshold (ppb)", f"{diag['threshold_sigma_ppb']:.2f}")
             dcols[3].metric("Final threshold (ppb)", f"{diag['threshold_final_ppb']:.2f}")
             st.caption(
-                f"Valid pixels: **{diag['valid_pixels']:,}** Â· "
-                f"Above threshold: **{diag['above_threshold']:,}** Â· "
+                f"Valid pixels: **{diag['valid_pixels']:,}** · "
+                f"Above threshold: **{diag['above_threshold']:,}** · "
                 f"Percentile cap (p{PARAMS['threshold_percentile_cap']:.0f}): **{diag['threshold_pct_ppb']:.2f} ppb**. "
-                f"The final threshold is the **minimum** of the Ïƒ-based value and the percentile cap."
+                f"The final threshold is the **minimum** of the σ-based value and the percentile cap."
             )
 
     result_items = [
-        ("detrended", "Î”Î© after detrend (ppb)", "Detrended"),
+        ("detrended", "ΔΩ after detrend (ppb)", "Detrended"),
         ("gaussian", "Gaussian smoothed", "Smoothed"),
         ("final", "Methane candidates", "Final mask"),
         ("valid", "Valid pixels", "Validity mask"),
@@ -1446,26 +1446,26 @@ if "result" in st.session_state:
             path = st.session_state.paths[key]
             format_choice = st.selectbox("Download format", ["GeoTIFF (georeferenced)", "PNG + World File (georeferenced)"], key=f"format_choice_{key}")
             if format_choice == "GeoTIFF (georeferenced)":
-                st.download_button("â¬‡ Download GeoTIFF", path.read_bytes(), file_name=path.name, mime="image/tiff", key=f"download_tif_compact_{key}", use_container_width=True)
+                st.download_button("⬇ Download GeoTIFF", path.read_bytes(), file_name=path.name, mime="image/tiff", key=f"download_tif_compact_{key}", use_container_width=True)
             else:
                 png_package = georeferenced_png_package(result[key], profile, mask=key in ("final", "valid"))
-                st.download_button("â¬‡ Download Georeferenced PNG package", png_package, file_name=f"{key}_georeferenced_png.zip", mime="application/zip", key=f"download_png_compact_{key}", use_container_width=True)
+                st.download_button("⬇ Download Georeferenced PNG package", png_package, file_name=f"{key}_georeferenced_png.zip", mime="application/zip", key=f"download_png_compact_{key}", use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown(f'<div class="result-note"><b>Robust thresholding v5:</b> median = <b>{result["mean"]:.2f} ppb</b>, robust Ïƒ = <b>{result["std"]:.2f} ppb</b>, threshold = <b>{result["threshold"]:.2f} ppb</b>. SCL cloud/shadow masking active. Initial: <b>{result["initial_count"]:,}</b> â†’ Final: <b>{result["final_count"]:,}</b> Â· c = <b>{result["c"]:.4f}</b> Â· detrend Ïƒ = <b>{DETREND_SIGMA:.0f} px</b> Â· floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="result-note"><b>Robust thresholding v5:</b> median = <b>{result["mean"]:.2f} ppb</b>, robust σ = <b>{result["std"]:.2f} ppb</b>, threshold = <b>{result["threshold"]:.2f} ppb</b>. SCL cloud/shadow masking active. Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · c = <b>{result["c"]:.4f}</b> · detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
     d1, d2 = st.columns([1, 3], gap="small")
     with d1:
-        st.download_button("â¬‡ Reference table CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection.csv", mime="text/csv", key="download_reference_csv_compact", use_container_width=True)
+        st.download_button("⬇ Reference table CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection.csv", mime="text/csv", key="download_reference_csv_compact", use_container_width=True)
     with d2:
-        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">Î”Î© (ppb) is a screening quantity following the MBMC framework (Cheng et al., 2026); it is not physical methane concentration or an emission rate.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">ΔΩ (ppb) is a screening quantity following the MBMC framework (Cheng et al., 2026); it is not physical methane concentration or an emission rate.</div>', unsafe_allow_html=True)
 
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">05a Â· 30-DAY TIME SERIES & VISUAL PLAYBACK</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">Track daily changes of detrended Î”Î© (ppb) over the 30-day window. Use the slider below the chart to visually scrub through each day.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">05a · 30-DAY TIME SERIES & VISUAL PLAYBACK</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">Track daily changes of detrended ΔΩ (ppb) over the 30-day window. Use the slider below the chart to visually scrub through each day.</div>', unsafe_allow_html=True)
 
     ts_col1, ts_col2 = st.columns([1, 3], gap="small")
     with ts_col1:
-        run_ts = st.button("ðŸ“ˆ  Build 30-day series + visuals", type="primary", use_container_width=True, key="build_ts_button", disabled=not bool(st.session_state.get("cdse_auth")))
+        run_ts = st.button("📈  Build 30-day series + visuals", type="primary", use_container_width=True, key="build_ts_button", disabled=not bool(st.session_state.get("cdse_auth")))
     with ts_col2:
         st.markdown('<div class="card-caption" style="margin-top:0.55rem;">Downloads and processes every Sentinel-2 scene in the window. Cached after first run.</div>', unsafe_allow_html=True)
 
@@ -1486,13 +1486,13 @@ if "result" in st.session_state:
                 by_day.setdefault(d, []).append(s)
             days_sorted = sorted(by_day.keys())
 
-            ts_progress = st.progress(0, text="Building time series¦")
+            ts_progress = st.progress(0, text="Building time series…")
             ts_status = st.empty()
             rows = []
             daily_visuals = {}
             total_days = max(1, len(days_sorted))
             for idx, day in enumerate(days_sorted, start=1):
-                ts_status.markdown(f'<div class="card-caption">Processing day {idx} of {total_days} Â· {day.isoformat()}</div>', unsafe_allow_html=True)
+                ts_status.markdown(f'<div class="card-caption">Processing day {idx} of {total_days} · {day.isoformat()}</div>', unsafe_allow_html=True)
                 ts_progress.progress(int(100 * idx / total_days), text=f"Day {idx} of {total_days}")
                 day_scenes = sorted(by_day[day], key=lambda s: get_cloud(s))
                 target_scene_day = day_scenes[0]
@@ -1521,7 +1521,7 @@ if "result" in st.session_state:
                 st.session_state.daily_visuals = daily_visuals
                 ts_progress.progress(100, text="Time series ready")
                 ts_status.empty()
-                st.success(f"Time series built Â· {len(ts_df)} day(s) processed Â· {len(daily_visuals)} visual frames")
+                st.success(f"Time series built · {len(ts_df)} day(s) processed · {len(daily_visuals)} visual frames")
             else:
                 st.warning("No valid day could be processed. Try a wider date range or a larger AOI.")
         except Exception as ts_error:
@@ -1532,7 +1532,7 @@ if "result" in st.session_state:
         if not ts.empty and "mean_mbmp" in ts.columns:
             chart_df = ts.dropna(subset=["mean_mbmp"]).set_index("date")[["mean_mbmp", "max_mbmp"]]
             if not chart_df.empty:
-                st.markdown('<div class="card-caption">Daily detrended Î”Î© (ppb) statistics in the AOI</div>', unsafe_allow_html=True)
+                st.markdown('<div class="card-caption">Daily detrended ΔΩ (ppb) statistics in the AOI</div>', unsafe_allow_html=True)
                 st.line_chart(chart_df, use_container_width=True, height=240)
                 st.dataframe(
                     ts,
@@ -1541,14 +1541,14 @@ if "result" in st.session_state:
                     height=180,
                     column_config={
                         "date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
-                        "mean_mbmp": st.column_config.NumberColumn("Mean Î”Î© (ppb)", format="%.2f"),
-                        "max_mbmp": st.column_config.NumberColumn("Max Î”Î© (ppb)", format="%.2f"),
-                        "std_mbmp": st.column_config.NumberColumn("Std Î”Î© (ppb)", format="%.2f"),
+                        "mean_mbmp": st.column_config.NumberColumn("Mean ΔΩ (ppb)", format="%.2f"),
+                        "max_mbmp": st.column_config.NumberColumn("Max ΔΩ (ppb)", format="%.2f"),
+                        "std_mbmp": st.column_config.NumberColumn("Std ΔΩ (ppb)", format="%.2f"),
                         "b4_correlation": st.column_config.NumberColumn("B4 corr", format="%.3f"),
                     },
                 )
                 st.download_button(
-                    "â¬‡ Download 30-day series CSV",
+                    "⬇ Download 30-day series CSV",
                     ts.to_csv(index=False),
                     file_name="s2_timeseries_30d.csv",
                     mime="text/csv",
@@ -1561,7 +1561,7 @@ if "result" in st.session_state:
         dates_available = sorted(visuals.keys())
         if dates_available:
             st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
-            st.markdown('<div class="card-caption" style="font-weight:700;font-size:0.85rem;">ðŸŽ¬ Visual daily playback ” drag the slider to scrub through the month</div>', unsafe_allow_html=True)
+            st.markdown('<div class="card-caption" style="font-weight:700;font-size:0.85rem;">🎬 Visual daily playback — drag the slider to scrub through the month</div>', unsafe_allow_html=True)
             selected_day = st.select_slider(
                 "Select day",
                 options=dates_available,
@@ -1573,23 +1573,23 @@ if "result" in st.session_state:
                 frame = visuals[selected_day]
                 v1, v2 = st.columns(2, gap="small")
                 with v1:
-                    st.markdown(f'<div class="card-caption" style="font-weight:700;">{selected_day} Â· Î”Î© detrended</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="card-caption" style="font-weight:700;">{selected_day} · ΔΩ detrended</div>', unsafe_allow_html=True)
                     st.image(frame["png_relative"], use_container_width=True, output_format="PNG")
                 with v2:
-                    st.markdown(f'<div class="card-caption" style="font-weight:700;">{selected_day} Â· Candidate mask</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="card-caption" style="font-weight:700;">{selected_day} · Candidate mask</div>', unsafe_allow_html=True)
                     st.image(frame["png_mask"], use_container_width=True, output_format="PNG")
                 m1, m2, m3 = st.columns(3, gap="small")
-                m1.metric("Mean Î”Î© (ppb)", f"{frame['mean_mbmp']:.2f}")
-                m2.metric("Max Î”Î© (ppb)", f"{frame['max_mbmp']:.2f}")
+                m1.metric("Mean ΔΩ (ppb)", f"{frame['mean_mbmp']:.2f}")
+                m2.metric("Max ΔΩ (ppb)", f"{frame['max_mbmp']:.2f}")
                 m3.metric("Candidate pixels", f"{frame['final_pixels']:,}")
 
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">05b Â· SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 Ã— 7 km). All pixels are shown (no QA filtering). Visualization is <b>anomaly relative to the local mean</b>.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). All pixels are shown (no QA filtering). Visualization is <b>anomaly relative to the local mean</b>.</div>', unsafe_allow_html=True)
 
     s5p_col1, s5p_col2 = st.columns([1, 3], gap="small")
     with s5p_col1:
-        run_s5p = st.button("ðŸ›°ï¸  Fetch S5P CH4", type="primary", use_container_width=True, key="s5p_button", disabled=not bool(st.session_state.get("cdse_auth")))
+        run_s5p = st.button("🛰️  Fetch S5P CH4", type="primary", use_container_width=True, key="s5p_button", disabled=not bool(st.session_state.get("cdse_auth")))
     with s5p_col2:
         s5p_days = st.slider("S5P temporal window (days around target)", 1, 30, 15, key="s5p_days")
 
@@ -1599,7 +1599,7 @@ if "result" in st.session_state:
             target_date = get_datetime(st.session_state.get("target"))
             if target_date is None:
                 raise RuntimeError("Target date is missing.")
-            with st.spinner("Fetching Sentinel-5P CH4¦"):
+            with st.spinner("Fetching Sentinel-5P CH4…"):
                 s5p_path = download_s5p_scene(
                     st.session_state.aoi,
                     target_date - timedelta(days=int(s5p_days)),
@@ -1624,7 +1624,7 @@ if "result" in st.session_state:
             ch4 = np.full_like(ch4, placeholder)
             valid_ch4 = ch4[np.isfinite(ch4)]
             st.warning(
-                "âš ï¸ Sentinel-5P returned no valid pixels for this AOI and time window "
+                "⚠️ Sentinel-5P returned no valid pixels for this AOI and time window "
                 "(cloud cover / QA). Showing the AOI center with a placeholder value. "
                 "Try increasing the temporal window to 30 days."
             )
@@ -1644,7 +1644,7 @@ if "result" in st.session_state:
             with leg_col:
                 st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
                 st.markdown(legend_html("s5p"), unsafe_allow_html=True)
-            st.markdown('<div class="card-caption">Each pixel is shown as deviation from the local mean (red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill may only occupy 1“2 pixels.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="card-caption">Each pixel is shown as deviation from the local mean (red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill may only occupy 1–2 pixels.</div>', unsafe_allow_html=True)
         else:
             st.warning("Not enough valid S5P CH4 pixels even after fallback. Increase the temporal window to 30 days.")
 
