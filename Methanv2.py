@@ -47,10 +47,11 @@ from skimage.morphology import disk
 from streamlit_folium import st_folium
 
 # ── Deep Learning imports ──
+import traceback
+
 try:
     import torch
-    torch.classes.__path__ = []  # رفع تداخل Streamlit و PyTorch
-    import streamlit as st
+    torch.classes.__path__ = []   # رفع تداخل معروف Streamlit + PyTorch
     import torch.nn as nn
     import torch.nn.functional as F
     from torch.utils.data import Dataset, DataLoader
@@ -58,10 +59,10 @@ try:
     from torchvision import models
     import timm
     TORCH_AVAILABLE = True
-except ImportError:
+except Exception as e:
     TORCH_AVAILABLE = False
-    st.warning("PyTorch / timm not installed. Deep learning features will be disabled. "
-               "Install with: pip install torch torchvision timm")
+    st.error(f"PyTorch import failed: {type(e).__name__}: {e}")
+    st.code(traceback.format_exc())
 
 warnings.filterwarnings("ignore")
 
