@@ -1,15 +1,15 @@
 """Sentinel-2 methane candidate screening app.
 
-MBMC-faithful v3 (final)
+MBMC-faithful v4 (calibrated + multi-band reference selection)
   • Aradkouh landfill (Tehran) as default AOI
   • Cloud cover 30% + last-30-days date defaults
-  • Robust reference selection with fallback
+  • Robust reference selection using B11/B12 SWIR bands (methane-relevant)
+  • QA warning when residual sigma is physically implausible
   • 30-day time-series + visual daily playback
   • Sentinel-5P CH4 with forced AOI-center display
 
-UI/design preserved from the original version.
-Algorithm engine re-implemented following the MBMC paper,
-with robust median/MAD thresholding and higher smoothing.
+UI/design preserved. Algorithm engine follows MBMC paper with recalibrated
+smoothing, adaptive floor, and multi-band reference scoring.
 """
 from __future__ import annotations
 
@@ -65,14 +65,15 @@ SITE_LAT = 35.505
 SITE_LON = 51.330
 SITE_RADIUS_M = 5000.0
 
-# ── MBMC paper constants ─────────────────────────────────────────────
+# ── MBMC paper constants (recalibrated for small AOI + S2 noise) ─────
 K_MBMP = 1.0e-5
-DETREND_SIGMA = 150.0
-ABS_FLOOR_PPB = 20.0
-N_SIGMA = 2.5
-GAUSS_SIGMA = 3.0          # ← تغییر ۱: از 1.5 به 3.0
+DETREND_SIGMA = 80.0        # ← کاهش از 150 (AOI کوچک ~1500 px)
+ABS_FLOOR_PPB = 5.0         # ← کاهش از 20 (σ واقعی انتظاری)
+N_SIGMA = 1.75              # ← کاهش از 2.5 (سیگنال ضعیف)
+GAUSS_SIGMA = 10.0          # ← افزایش از 3.0 (سرکوب نویز ۲۰ متری S2)
 FLOOD_MIN_SIZE = 10
 DILATE_RADIUS_FINAL = 3
+SIGMA_WARN_PPB = 50.0       # آستانهٔ هشدار QA — σ بالاتر = reference ناسالم
 
 PARAMS = {
     "b03_quantile": 0.05,
@@ -92,8 +93,9 @@ PARAMS = {
     "abs_floor_ppb": ABS_FLOOR_PPB,
     "detrend_sigma": DETREND_SIGMA,
     "k_mbmp": K_MBMP,
-    "max_plume_area_km2": 10.0,
+    "max_plume_area_km2": 100.0,   # ← افزایش از 10 (تهران بزرگ‌تر از 10 km²)
     "site_radius_m": SITE_RADIUS_M,
+    "sigma_warn_ppb": SIGMA_WARN_PPB,
 }
 
 
@@ -390,6 +392,65 @@ def normalized_difference(first, second):
     return output
 
 
+def _safe_corr(a, b):
+    """Safe Pearson correlation for possibly degenerate arrays."""
+    if a.size < 2 or b.size < 2:
+        return np.nan
+    if np.std(a) < 1e-9 or np.std(b) < 1e-9:
+        return np.nan
+    try:
+        value = float(np.corrcoef(a, b)[0, 1])
+    except Exception:
+        return np.nan
+    return value if np.isfinite(value) else np.nan
+
+
+def evaluate_reference(target_bands, reference_bands, min_pixels):
+    """Multi-band reference quality assessment.
+
+    Returns (combined_score, corr_b04, corr_b11, corr_b12, valid_count).
+    Combined score weights the methane-relevant SWIR bands (B11, B12)
+    more heavily than B04, since ΔR is computed in the SWIR.
+    """
+    valid = (
+        np.isfinite(target_bands["B04"]) & np.isfinite(reference_bands["B04"]) &
+        np.isfinite(target_bands["B11"]) & np.isfinite(reference_bands["B11"]) &
+        np.isfinite(target_bands["B12"]) & np.isfinite(reference_bands["B12"])
+    )
+    valid_count = int(valid.sum())
+    if valid_count < min_pixels:
+        return np.nan, np.nan, np.nan, np.nan, valid_count
+
+    t_b04 = target_bands["B04"][valid]
+    r_b04 = reference_bands["B04"][valid]
+    t_b11 = target_bands["B11"][valid]
+    r_b11 = reference_bands["B11"][valid]
+    t_b12 = target_bands["B12"][valid]
+    r_b12 = reference_bands["B12"][valid]
+
+    corr_b04 = _safe_corr(t_b04, r_b04)
+    corr_b11 = _safe_corr(t_b11, r_b11)
+    corr_b12 = _safe_corr(t_b12, r_b12)
+
+    weights = []
+    values = []
+    if np.isfinite(corr_b11):
+        weights.append(0.45); values.append(corr_b11)
+    if np.isfinite(corr_b12):
+        weights.append(0.45); values.append(corr_b12)
+    if np.isfinite(corr_b04):
+        weights.append(0.10); values.append(corr_b04)
+
+    if not values or sum(weights) < 0.4:
+        combined = np.nan
+    else:
+        w = np.asarray(weights, dtype=np.float64)
+        v = np.asarray(values, dtype=np.float64)
+        combined = float(np.sum(w * v) / np.sum(w))
+
+    return combined, corr_b04, corr_b11, corr_b12, valid_count
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  CORE ALGORITHM (MBMC-faithful + robust thresholding)
 # ══════════════════════════════════════════════════════════════════════
@@ -681,37 +742,36 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
         target_tile = get_tile(target_scene)
         same_tile = [r for r in reference_scenes if get_tile(r) == target_tile]
         candidates = same_tile if same_tile else reference_scenes
+
         best_ref_bands = None
-        best_corr = -np.inf
-        best_valid_count = 0
+        best_score = -np.inf
+        best_b4 = np.nan
+        best_valid = 0
+
         for ref in candidates:
             try:
                 ref_bands, _ = read_stack(download_scene(ref, aoi, access_token))
             except Exception:
                 continue
-            valid_px = np.isfinite(target_bands["B04"]) & np.isfinite(ref_bands["B04"])
-            valid_count = int(valid_px.sum())
-            if valid_count >= PARAMS["min_valid_ref_pixels"]:
-                t_vals = target_bands["B04"][valid_px]
-                r_vals = ref_bands["B04"][valid_px]
-                corr = np.nan
-                if np.std(t_vals) > 1e-9 and np.std(r_vals) > 1e-9:
-                    try:
-                        corr = float(np.corrcoef(t_vals, r_vals)[0, 1])
-                    except Exception:
-                        corr = np.nan
-                if np.isfinite(corr) and corr > best_corr:
-                    best_corr = corr
-                    best_ref_bands = ref_bands
-                    best_valid_count = valid_count
-                elif best_ref_bands is None and valid_count > best_valid_count:
-                    best_valid_count = valid_count
-                    best_ref_bands = ref_bands
-                    best_corr = np.nan
+            combined, corr_b04, _, _, valid_count = evaluate_reference(
+                target_bands, ref_bands, PARAMS["min_valid_ref_pixels"]
+            )
+            if np.isfinite(combined) and combined > best_score:
+                best_score = combined
+                best_ref_bands = ref_bands
+                best_b4 = corr_b04
+                best_valid = valid_count
+            elif best_ref_bands is None and valid_count > best_valid:
+                best_ref_bands = ref_bands
+                best_valid = valid_count
+                best_score = np.nan
+                best_b4 = corr_b04
+
         if best_ref_bands is None:
             return None
+
         result = run_algorithm(target_bands, best_ref_bands, target_profile)
-        # ← تغییر ۲: mean/max/std از detrended محاسبه می‌شن
+
         row = {
             "date": target_date,
             "mean_mbmp": float(np.nanmean(result["detrended"])),
@@ -719,7 +779,8 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
             "std_mbmp": float(np.nanstd(result["detrended"])),
             "final_pixels": int(result["final_count"]),
             "regions": int(result["regions"]),
-            "b4_correlation": float(best_corr) if np.isfinite(best_corr) else np.nan,
+            "ref_score": float(best_score) if np.isfinite(best_score) else np.nan,
+            "b4_correlation": float(best_b4) if np.isfinite(best_b4) else np.nan,
         }
         if store_image:
             row["png_relative"] = image_png(result["detrended"])
@@ -806,7 +867,7 @@ st.markdown("""
         <div class="app-title">🛰️ Sentinel-2 Methane Screening</div>
         <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC-faithful ΔΩ (ppb) candidate detection</div>
     </div>
-    <div class="status-pill">20 m processing &nbsp;•&nbsp; Light dashboard</div>
+    <div class="status-pill">20 m processing &nbsp;•&nbsp; Multi-band reference scoring</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -841,7 +902,7 @@ with control_col:
     with s1:
         max_cloud = st.slider("Cloud cover (%)", 0.0, 100.0, 30.0, key="max_cloud")
     with s2:
-        reference_days = st.slider("Reference window (days)", 1, 90, 60, key="reference_days")
+        reference_days = st.slider("Reference window (days)", 1, 90, 15, key="reference_days")
 
     if st.button("🔎  Search Sentinel-2 scenes", type="primary", use_container_width=True):
         try:
@@ -951,7 +1012,8 @@ with settings_col:
     with p3:
         PARAMS["final_dilation"] = st.number_input("Final dilation radius", min_value=0, max_value=20, value=int(PARAMS["final_dilation"]), step=1, key="final_dilation")
     estimated_area_m2 = int(PARAMS["min_component_pixels"]) * RESOLUTION * RESOLUTION
-    st.markdown(f'<div class="card-caption">Minimum connected region ≈ {estimated_area_m2:,} m² at {RESOLUTION} m resolution.</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="card-caption">Minimum connected region ≈ {estimated_area_m2:,} m² at {RESOLUTION} m resolution. '
+                f'Gaussian σ = {GAUSS_SIGMA:.0f} px · detrend σ = {DETREND_SIGMA:.0f} px · absolute floor = {ABS_FLOOR_PPB:.1f} ppb.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with action_col:
@@ -1024,14 +1086,15 @@ with action_col:
                     target_bands, profile = read_stack(download_scene(target, st.session_state.aoi, access_token))
 
                     best_reference = None
-                    best_correlation = -np.inf
-                    best_valid_count = 0
+                    best_score = -np.inf
+                    best_b4 = np.nan
+                    best_valid = 0
                     reference_rows = []
                     total_refs = max(1, len(references))
 
                     for ref_index, reference in enumerate(references, start=1):
                         pct = 30 + int(40 * (ref_index - 1) / total_refs)
-                        progress_status.markdown(f'<div class="card-caption">Step 3 of 5 · Downloading and comparing reference scene {ref_index} of {total_refs}…</div>', unsafe_allow_html=True)
+                        progress_status.markdown(f'<div class="card-caption">Step 3 of 5 · Evaluating reference scene {ref_index} of {total_refs} (multi-band SWIR scoring)…</div>', unsafe_allow_html=True)
                         progress.progress(pct, text=f"Reference scene {ref_index} of {total_refs}…")
 
                         try:
@@ -1041,57 +1104,56 @@ with action_col:
                                 "id": as_dict(reference).get("id"),
                                 "date": get_datetime(reference),
                                 "tile": get_tile(reference),
-                                "b4_correlation": np.nan,
-                                "valid_b4_pixels": 0,
+                                "ref_score": np.nan,
+                                "b04_correlation": np.nan,
+                                "b11_correlation": np.nan,
+                                "b12_correlation": np.nan,
+                                "valid_pixels": 0,
                                 "status": "download failed",
                             })
                             continue
 
-                        valid_pixels = np.isfinite(target_bands["B04"]) & np.isfinite(reference_bands["B04"])
-                        valid_count = int(valid_pixels.sum())
-
-                        correlation = np.nan
-                        if valid_count >= PARAMS["min_valid_ref_pixels"]:
-                            t_vals = target_bands["B04"][valid_pixels]
-                            r_vals = reference_bands["B04"][valid_pixels]
-                            if np.std(t_vals) > 1e-9 and np.std(r_vals) > 1e-9:
-                                try:
-                                    correlation = float(np.corrcoef(t_vals, r_vals)[0, 1])
-                                except Exception:
-                                    correlation = np.nan
+                        combined, corr_b04, corr_b11, corr_b12, valid_count = evaluate_reference(
+                            target_bands, reference_bands, PARAMS["min_valid_ref_pixels"]
+                        )
 
                         reference_rows.append({
                             "id": as_dict(reference).get("id"),
                             "date": get_datetime(reference),
                             "tile": get_tile(reference),
-                            "b4_correlation": correlation,
-                            "valid_b4_pixels": valid_count,
-                            "status": "ok" if np.isfinite(correlation) else "low-validity",
+                            "ref_score": combined,
+                            "b04_correlation": corr_b04,
+                            "b11_correlation": corr_b11,
+                            "b12_correlation": corr_b12,
+                            "valid_pixels": valid_count,
+                            "status": "ok" if np.isfinite(combined) else "low-validity",
                         })
 
-                        if np.isfinite(correlation) and correlation > best_correlation:
-                            best_correlation = correlation
+                        if np.isfinite(combined) and combined > best_score:
+                            best_score = combined
                             best_reference = reference_bands
-                            best_valid_count = valid_count
-                        elif best_reference is None and valid_count > best_valid_count:
-                            best_valid_count = valid_count
+                            best_b4 = corr_b04
+                            best_valid = valid_count
+                        elif best_reference is None and valid_count > best_valid:
+                            best_valid = valid_count
                             best_reference = reference_bands
-                            best_correlation = np.nan
+                            best_score = np.nan
+                            best_b4 = corr_b04
 
                     st.session_state.reference_table = pd.DataFrame(reference_rows)
 
                     if best_reference is None:
-                        total_valid = sum(int(r.get("valid_b4_pixels", 0)) for r in reference_rows)
+                        total_valid = sum(int(r.get("valid_pixels", 0)) for r in reference_rows)
                         target_valid = int(np.isfinite(target_bands["B04"]).sum())
                         st.error(
                             f"Could not select a reference scene.\n\n"
                             f"- References downloaded: **{len(reference_rows)}**\n"
-                            f"- Total valid B4 pixels across all references: **{total_valid:,}**\n"
+                            f"- Total valid pixels across all references: **{total_valid:,}**\n"
                             f"- Target valid B4 pixels: **{target_valid:,}**\n\n"
                             f"**Suggestions:**\n"
                             f"1. Increase the **date range** (make start date earlier).\n"
                             f"2. Increase the **cloud cover** threshold to 50–70%.\n"
-                            f"3. Increase **Reference window (days)** to 90.\n"
+                            f"3. Increase **Reference window (days)** to 30–60.\n"
                             f"4. Enlarge the AOI on the map (at least ~30×30 km)."
                         )
                         st.stop()
@@ -1099,7 +1161,8 @@ with action_col:
                     progress_status.markdown('<div class="card-caption">Step 4 of 5 · Running MBMC ΔΩ (ppb) anomaly detection and candidate cleanup…</div>', unsafe_allow_html=True)
                     progress.progress(78, text="Running methane detection…")
                     result = run_algorithm(target_bands, best_reference, profile)
-                    result["b4_correlation"] = best_correlation if np.isfinite(best_correlation) else float("nan")
+                    result["b4_correlation"] = float(best_b4) if np.isfinite(best_b4) else float("nan")
+                    result["combined_score"] = float(best_score) if np.isfinite(best_score) else float("nan")
                     result["date"] = target_date.strftime("%Y-%m-%d")
 
                     signal_ratio = result["final_count"] / max(1, result["valid_count"])
@@ -1125,12 +1188,25 @@ with action_col:
                     progress.progress(100, text="Ready to detect · outputs are ready")
                     st.success("Processing completed")
 
+                    # ── QA warnings ────────────────────────────────────
+                    if result["std"] > SIGMA_WARN_PPB:
+                        st.warning(
+                            f"⚠️ **Residual noise is physically implausible** "
+                            f"(robust σ = **{result['std']:.1f} ppb**, threshold above "
+                            f"~{SIGMA_WARN_PPB:.0f} ppb suggests the reference scene is unreliable). "
+                            f"Real methane fluctuations between two S2 acquisitions rarely exceed "
+                            f"10–30 ppb after detrending. The candidate mask in this run is likely "
+                            f"dominated by residual surface/aerosol noise rather than real CH4. "
+                            f"**Try:** (1) a reference date within 5–10 days, (2) a larger AOI, "
+                            f"(3) higher Gaussian σ (e.g. 15–20 px)."
+                        )
+
                     if result["final_count"] == 0:
                         st.warning(
                             f"⚠️ **No plume above threshold detected.** "
                             f"Median ΔΩ = {result['mean']:.2f} ppb, robust σ = {result['std']:.2f} ppb, "
                             f"threshold = {result['threshold']:.2f} ppb. "
-                            f"Try lowering the Threshold multiplier to 1.5–2.0, or pick a different "
+                            f"Try lowering the Threshold multiplier to 1.2–1.5, or pick a different "
                             f"target/reference date pair."
                         )
                     elif signal_ratio < 0.00005:
@@ -1158,15 +1234,22 @@ if "result" in st.session_state:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
     metrics = st.columns(6, gap="small")
-    corr_text = f"{result['b4_correlation']:.3f}" if np.isfinite(result.get("b4_correlation", np.nan)) else "n/a"
-    metrics[0].metric("B4 correlation", corr_text)
+
+    combined_display = result.get("combined_score", np.nan)
+    if np.isfinite(combined_display):
+        score_text = f"{combined_display:.3f}"
+    elif np.isfinite(result.get("b4_correlation", np.nan)):
+        score_text = f"{result['b4_correlation']:.3f} (B4)"
+    else:
+        score_text = "n/a"
+
+    metrics[0].metric("Ref score (SWIR-weighted)", score_text)
     metrics[1].metric("Valid pixels", f"{result['valid_count']:,}")
     metrics[2].metric("Initial", f"{result['initial_count']:,}")
     metrics[3].metric("Final", f"{result['final_count']:,}")
     metrics[4].metric("Regions", result["regions"])
     metrics[5].metric("Threshold", f"{result['threshold']:.2f}")
 
-    # ← تغییر ۳: پنل‌های بالا حالا detrended اول، و valid آخر
     result_items = [
         ("detrended", "ΔΩ after detrend (ppb)", "Detrended"),
         ("gaussian", "Gaussian smoothed", "Smoothed"),
@@ -1201,12 +1284,12 @@ if "result" in st.session_state:
             st.markdown('</div>', unsafe_allow_html=True)
 
     removed_pixels = max(0, int(result["initial_count"]) - int(result["final_count"]))
-    st.markdown(f'<div class="result-note"><b>Robust thresholding:</b> median = <b>{result["mean"]:.2f} ppb</b>, robust σ = <b>{result["std"]:.2f} ppb</b>, threshold = <b>{result["threshold"]:.2f} ppb</b>. Only the largest connected region ≥ <b>{int(PARAMS["min_component_pixels"]):,} px</b> was kept (MBMC convention). Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · c = <b>{result["c"]:.4f}</b> · detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="result-note"><b>Robust thresholding:</b> median = <b>{result["mean"]:.2f} ppb</b>, robust σ = <b>{result["std"]:.2f} ppb</b>, threshold = <b>{result["threshold"]:.2f} ppb</b>. Only the largest connected region ≥ <b>{int(PARAMS["min_component_pixels"]):,} px</b> was kept (MBMC convention). Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · c = <b>{result["c"]:.4f}</b> · detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · gaussian σ = <b>{GAUSS_SIGMA:.0f} px</b> · floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
     d1, d2 = st.columns([1, 3], gap="small")
     with d1:
         st.download_button("⬇ Reference table CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection.csv", mime="text/csv", key="download_reference_csv_compact", use_container_width=True)
     with d2:
-        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">ΔΩ (ppb) is a screening quantity following the MBMC framework (Cheng et al., 2026); it is not physical methane concentration or an emission rate.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">ΔΩ (ppb) is a screening quantity following the MBMC framework (Cheng et al., 2026); it is not physical methane concentration or an emission rate. Reference scoring now weights the SWIR bands (B11/B12) that carry the methane signal.</div>', unsafe_allow_html=True)
 
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05a · 30-DAY TIME SERIES & VISUAL PLAYBACK</div>', unsafe_allow_html=True)
@@ -1249,7 +1332,7 @@ if "result" in st.session_state:
                     s for s in window_scenes
                     if as_dict(s).get("id") != as_dict(target_scene_day).get("id")
                     and get_datetime(s) is not None
-                    and abs((get_datetime(s) - get_datetime(target_scene_day)).total_seconds()) / 86400 <= 15
+                    and abs((get_datetime(s) - get_datetime(target_scene_day)).total_seconds()) / 86400 <= 10
                 ]
                 if not refs:
                     continue
@@ -1293,6 +1376,7 @@ if "result" in st.session_state:
                         "mean_mbmp": st.column_config.NumberColumn("Mean ΔΩ (ppb)", format="%.2f"),
                         "max_mbmp": st.column_config.NumberColumn("Max ΔΩ (ppb)", format="%.2f"),
                         "std_mbmp": st.column_config.NumberColumn("Std ΔΩ (ppb)", format="%.2f"),
+                        "ref_score": st.column_config.NumberColumn("Ref score", format="%.3f"),
                         "b4_correlation": st.column_config.NumberColumn("B4 corr", format="%.3f"),
                     },
                 )
