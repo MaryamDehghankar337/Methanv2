@@ -1,13 +1,13 @@
 """Sentinel-2 methane candidate screening app.
 
 MBMC-faithful v5 (cloud-aware, robust threshold, multi-datasource fix)
-  â€¢ SCL-based cloud & shadow masking via two-datasource evalscript
-  â€¢ Trimmed-std robust noise estimation (fat-tail safe)
-  â€¢ Percentile-capped threshold (prevents runaway Ïƒ)
-  â€¢ Location search (Nominatim) + jump-to-location + coordinates panel
-  â€¢ Aradkouh landfill (Tehran) as default AOI
-  â€¢ 30-day time-series + visual daily playback
-  â€¢ Sentinel-5P CH4 context layer
+   SCL-based cloud & shadow masking via two-datasource evalscript
+   Trimmed-std robust noise estimation (fat-tail safe)
+   Percentile-capped threshold (prevents runaway Ïƒ)
+   Location search (Nominatim) + jump-to-location + coordinates panel
+   Aradkouh landfill (Tehran) as default AOI
+   30-day time-series + visual daily playback
+   Sentinel-5P CH4 context layer
 """
 from __future__ import annotations
 
@@ -949,7 +949,7 @@ st.markdown("""
         <div class="app-title">ðŸ›°ï¸ Sentinel-2 Methane Screening</div>
         <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC-faithful Î”Î© (ppb) candidate detection &nbsp;|&nbsp; v5 cloud-aware</div>
     </div>
-    <div class="status-pill">20 m processing &nbsp;â€¢&nbsp; Light dashboard</div>
+    <div class="status-pill">20 m processing &nbsp;&nbsp; Light dashboard</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -970,7 +970,7 @@ with map_col:
     with search_col1:
         search_query = st.text_input(
             "Location search",
-            placeholder="ðŸ”Ž  Search a place  (e.g. Tehran, Aradkouh landfill, Paris, â€¦)",
+            placeholder="ðŸ”Ž  Search a place  (e.g. Tehran, Aradkouh landfill, Paris, ¦)",
             key="location_search_input",
             label_visibility="collapsed",
         )
@@ -982,7 +982,7 @@ with map_col:
         if not query:
             st.warning("Please type a location name first.")
         else:
-            with st.spinner("Searching locationâ€¦"):
+            with st.spinner("Searching location¦"):
                 geo = geocode_location(query)
             if geo:
                 st.session_state["search_center"] = [geo[0], geo[1]]
@@ -1034,7 +1034,7 @@ with map_col:
     if st.session_state.get("search_center"):
         sc = st.session_state["search_center"]
         sname = st.session_state.get("search_name", "Searched location")
-        short_name = (sname[:70] + "â€¦") if len(sname) > 70 else sname
+        short_name = (sname[:70] + "¦") if len(sname) > 70 else sname
         coord_lines.append(
             f'<div class="coord-row">'
             f'<span class="coord-label">ðŸ“ {short_name}</span>'
@@ -1054,7 +1054,7 @@ with map_col:
     coord_lines.append(
         '<div class="coord-row"><span class="coord-label" style="opacity:0.65;font-weight:500;">'
         'Live mouse position shown on the map (bottom-right corner).</span>'
-        '<span class="coord-value" style="opacity:0.65;">â€”</span></div>'
+        '<span class="coord-value" style="opacity:0.65;">”</span></div>'
     )
 
     st.markdown(
@@ -1216,7 +1216,7 @@ with action_col:
             login_submitted = st.form_submit_button("ðŸ” Login & connect", type="primary", use_container_width=True)
         if login_submitted:
             try:
-                with st.spinner("Connecting to Copernicusâ€¦"):
+                with st.spinner("Connecting to Copernicus¦"):
                     st.session_state.cdse_auth = authenticate_cdse(login_user, login_password, login_totp)
                 st.success("Copernicus login successful. You can now run the detection.")
                 st.rerun()
@@ -1235,11 +1235,11 @@ with action_col:
             if not st.session_state.get("cdse_auth"):
                 st.markdown('<div class="card-caption">Please connect your Copernicus account above before downloading Sentinel-2 data.</div>', unsafe_allow_html=True)
             if detect_clicked:
-                progress = st.progress(0, text="Preparing methane detectionâ€¦")
+                progress = st.progress(0, text="Preparing methane detection¦")
                 progress_status = st.empty()
                 try:
-                    progress_status.markdown('<div class="card-caption">Step 1 of 5 Â· Connecting to CDSE and preparing the target sceneâ€¦</div>', unsafe_allow_html=True)
-                    progress.progress(8, text="Preparing target sceneâ€¦")
+                    progress_status.markdown('<div class="card-caption">Step 1 of 5 Â· Connecting to CDSE and preparing the target scene¦</div>', unsafe_allow_html=True)
+                    progress.progress(8, text="Preparing target scene¦")
                     access_token = get_access_token()
                     target = st.session_state["target"]
                     target_date = get_datetime(target)
@@ -1257,8 +1257,8 @@ with action_col:
                     if not references:
                         st.warning("No reference scene exists in the selected time window. Increase the date range or reference window.")
                         st.stop()
-                    progress_status.markdown('<div class="card-caption">Step 2 of 5 Â· Downloading target image bands and preparing the AOIâ€¦</div>', unsafe_allow_html=True)
-                    progress.progress(25, text="Downloading target bandsâ€¦")
+                    progress_status.markdown('<div class="card-caption">Step 2 of 5 Â· Downloading target image bands and preparing the AOI¦</div>', unsafe_allow_html=True)
+                    progress.progress(25, text="Downloading target bands¦")
                     target_bands, profile = read_stack(download_scene(target, st.session_state.aoi, access_token))
 
                     best_reference = None
@@ -1269,8 +1269,8 @@ with action_col:
 
                     for ref_index, reference in enumerate(references, start=1):
                         pct = 30 + int(40 * (ref_index - 1) / total_refs)
-                        progress_status.markdown(f'<div class="card-caption">Step 3 of 5 Â· Downloading and comparing reference scene {ref_index} of {total_refs}â€¦</div>', unsafe_allow_html=True)
-                        progress.progress(pct, text=f"Reference scene {ref_index} of {total_refs}â€¦")
+                        progress_status.markdown(f'<div class="card-caption">Step 3 of 5 Â· Downloading and comparing reference scene {ref_index} of {total_refs}¦</div>', unsafe_allow_html=True)
+                        progress.progress(pct, text=f"Reference scene {ref_index} of {total_refs}¦")
 
                         try:
                             reference_bands, _ = read_stack(download_scene(reference, st.session_state.aoi, access_token))
@@ -1328,14 +1328,14 @@ with action_col:
                             f"- Target valid B4 pixels: **{target_valid:,}**\n\n"
                             f"**Suggestions:**\n"
                             f"1. Increase the **date range** (make start date earlier).\n"
-                            f"2. Increase the **cloud cover** threshold to 50â€“70%.\n"
+                            f"2. Increase the **cloud cover** threshold to 50“70%.\n"
                             f"3. Increase **Reference window (days)** to 90.\n"
                             f"4. Enlarge the AOI on the map (at least ~30Ã—30 km)."
                         )
                         st.stop()
 
-                    progress_status.markdown('<div class="card-caption">Step 4 of 5 Â· Running MBMC Î”Î© (ppb) anomaly detection and candidate cleanupâ€¦</div>', unsafe_allow_html=True)
-                    progress.progress(78, text="Running methane detectionâ€¦")
+                    progress_status.markdown('<div class="card-caption">Step 4 of 5 Â· Running MBMC Î”Î© (ppb) anomaly detection and candidate cleanup¦</div>', unsafe_allow_html=True)
+                    progress.progress(78, text="Running methane detection¦")
                     result = run_algorithm(target_bands, best_reference, profile)
                     result["b4_correlation"] = best_correlation if np.isfinite(best_correlation) else float("nan")
                     result["date"] = target_date.strftime("%Y-%m-%d")
@@ -1359,7 +1359,7 @@ with action_col:
                         "final": image_png(result["final"], mask=True),
                         "valid": image_png(result["valid"], mask=True),
                     }
-                    progress_status.markdown('<div class="card-caption">Step 5 of 5 Â· Saving georeferenced outputs and preparing downloadsâ€¦</div>', unsafe_allow_html=True)
+                    progress_status.markdown('<div class="card-caption">Step 5 of 5 Â· Saving georeferenced outputs and preparing downloads¦</div>', unsafe_allow_html=True)
                     progress.progress(100, text="Ready to detect Â· outputs are ready")
                     st.success("Processing completed")
 
@@ -1368,7 +1368,7 @@ with action_col:
                             f"âš ï¸ **No plume above threshold detected.** "
                             f"Median Î”Î© = {result['mean']:.2f} ppb, robust Ïƒ = {result['std']:.2f} ppb, "
                             f"threshold = {result['threshold']:.2f} ppb. "
-                            f"Try lowering the Threshold multiplier to 1.5â€“2.0, or pick a different "
+                            f"Try lowering the Threshold multiplier to 1.5“2.0, or pick a different "
                             f"target/reference date pair."
                         )
                     elif signal_ratio < 0.00005:
@@ -1486,7 +1486,7 @@ if "result" in st.session_state:
                 by_day.setdefault(d, []).append(s)
             days_sorted = sorted(by_day.keys())
 
-            ts_progress = st.progress(0, text="Building time seriesâ€¦")
+            ts_progress = st.progress(0, text="Building time series¦")
             ts_status = st.empty()
             rows = []
             daily_visuals = {}
@@ -1561,7 +1561,7 @@ if "result" in st.session_state:
         dates_available = sorted(visuals.keys())
         if dates_available:
             st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
-            st.markdown('<div class="card-caption" style="font-weight:700;font-size:0.85rem;">ðŸŽ¬ Visual daily playback â€” drag the slider to scrub through the month</div>', unsafe_allow_html=True)
+            st.markdown('<div class="card-caption" style="font-weight:700;font-size:0.85rem;">ðŸŽ¬ Visual daily playback ” drag the slider to scrub through the month</div>', unsafe_allow_html=True)
             selected_day = st.select_slider(
                 "Select day",
                 options=dates_available,
@@ -1599,7 +1599,7 @@ if "result" in st.session_state:
             target_date = get_datetime(st.session_state.get("target"))
             if target_date is None:
                 raise RuntimeError("Target date is missing.")
-            with st.spinner("Fetching Sentinel-5P CH4â€¦"):
+            with st.spinner("Fetching Sentinel-5P CH4¦"):
                 s5p_path = download_s5p_scene(
                     st.session_state.aoi,
                     target_date - timedelta(days=int(s5p_days)),
@@ -1644,7 +1644,7 @@ if "result" in st.session_state:
             with leg_col:
                 st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
                 st.markdown(legend_html("s5p"), unsafe_allow_html=True)
-            st.markdown('<div class="card-caption">Each pixel is shown as deviation from the local mean (red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill may only occupy 1â€“2 pixels.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="card-caption">Each pixel is shown as deviation from the local mean (red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill may only occupy 1“2 pixels.</div>', unsafe_allow_html=True)
         else:
             st.warning("Not enough valid S5P CH4 pixels even after fallback. Increase the temporal window to 30 days.")
 
