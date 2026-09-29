@@ -8,5 +8,7 @@ rasterio
 scipy
 shapely
 scikit-image
-Pillow
+pillow
 matplotlib
+torch
+torchvision
