@@ -1,7 +1,8 @@
-streamlit
-torch==2.3.0
-torchvision==0.18.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.3.0+cpu
+torchvision==0.18.0+cpu
 timm==0.9.16
+streamlit
 numpy==1.26.4
 pandas
 matplotlib
