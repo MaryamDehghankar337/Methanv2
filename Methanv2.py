@@ -1,7 +1,7 @@
 """Sentinel-2 methane candidate screening app.
 
-MBMC-faithful v4 (cloud-aware, robust threshold)
-  • SCL-based cloud & shadow masking (critical fix)
+MBMC-faithful v5 (cloud-aware, robust threshold, multi-datasource fix)
+  • SCL-based cloud & shadow masking via two-datasource evalscript
   • Trimmed-std robust noise estimation (fat-tail safe)
   • Percentile-capped threshold (prevents runaway σ)
   • Location search (Nominatim) + jump-to-location + coordinates panel
@@ -44,7 +44,7 @@ STAC_URL = "https://stac.dataspace.copernicus.eu/v1/"
 TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 
-# ── CHANGE 1: SCL added to bands for cloud/shadow masking ──
+# ── SCL added to bands for cloud/shadow masking ──
 BANDS = ["B03", "B04", "B08", "B11", "B12", "SCL"]
 RESOLUTION = 20
 CACHE_DIR = Path.home() / ".sentinel_methane_cache"
@@ -60,12 +60,12 @@ SITE_LAT = 35.505
 SITE_LON = 51.330
 SITE_RADIUS_M = 5000.0
 
-# ── CHANGE 2: tuned MBMC constants ──
+# ── Tuned MBMC constants ──
 K_MBMP = 1.0e-5
-DETREND_SIGMA = 200.0     # was 150 → stronger background removal
+DETREND_SIGMA = 200.0
 ABS_FLOOR_PPB = 20.0
-N_SIGMA = 2.0             # was 2.5 → less conservative
-GAUSS_SIGMA = 5.0         # was 3.0 → more smoothing (denoise)
+N_SIGMA = 2.0
+GAUSS_SIGMA = 5.0
 FLOOD_MIN_SIZE = 10
 DILATE_RADIUS_FINAL = 3
 
@@ -89,9 +89,7 @@ PARAMS = {
     "k_mbmp": K_MBMP,
     "max_plume_area_km2": 10.0,
     "site_radius_m": SITE_RADIUS_M,
-    # Percentile cap so threshold never exceeds this quantile of the residual
     "threshold_percentile_cap": 99.0,
-    # Percentile range for trimmed std
     "trim_low_pct": 10.0,
     "trim_high_pct": 90.0,
 }
@@ -279,22 +277,22 @@ def get_access_token():
     raise RuntimeError("Your Copernicus session expired. Please log in again.")
 
 
-# ── CHANGE 3: evalscript now returns 6 bands (SCL included) ──
+# ── FIX: two-datasource evalscript (reflectance + SCL) ──
 def evalscript():
     return """//VERSION=3
 function setup() {
   return {
     input: [
-      {bands: ["B03","B04","B08","B11","B12"], units: "REFLECTANCE"},
-      {bands: ["SCL"]}
+      {bands: ["B03","B04","B08","B11","B12"], units: "REFLECTANCE", datasource: "refl"},
+      {bands: ["SCL"], datasource: "scl"}
     ],
     output: {bands: 6, sampleType: "FLOAT32"}
   };
 }
 function evaluatePixel(samples) {
-  var s = samples[0];
-  var scl = samples[1].SCL;
-  return [s.B03, s.B04, s.B08, s.B11, s.B12, scl];
+  var refl = samples.refl[0];
+  var scl = samples.scl[0];
+  return [refl.B03, refl.B04, refl.B08, refl.B11, refl.B12, scl.SCL];
 }
 """
 
@@ -316,7 +314,7 @@ function evaluatePixel(sample) {
 def download_scene(item, aoi, access_token):
     item = as_dict(item)
     aoi = ensure_aoi(aoi)
-    cache_id = hashlib.sha256(json.dumps([item.get("id"), aoi, RESOLUTION, "v4"], sort_keys=True).encode()).hexdigest()[:24]
+    cache_id = hashlib.sha256(json.dumps([item.get("id"), aoi, RESOLUTION, "v5"], sort_keys=True).encode()).hexdigest()[:24]
     folder = CACHE_DIR / cache_id
     output_path = folder / "bands.tif"
     metadata_path = folder / "metadata.json"
@@ -330,12 +328,40 @@ def download_scene(item, aoi, access_token):
     acquisition = get_datetime(item)
     if acquisition is None:
         raise RuntimeError("Could not read acquisition date.")
+
+    # ── FIX: two data objects with distinct ids (refl + scl) ──
+    time_from = acquisition.strftime("%Y-%m-%dT00:00:00Z")
+    time_to = (acquisition + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
     payload = {
         "input": {
-            "bounds": {"bbox": [minx, miny, maxx, maxy], "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}},
-            "data": [{"type": "sentinel-2-l2a", "dataFilter": {"timeRange": {"from": acquisition.strftime("%Y-%m-%dT00:00:00Z"), "to": (acquisition + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")}, "mosaickingOrder": "leastCC"}}],
+            "bounds": {
+                "bbox": [minx, miny, maxx, maxy],
+                "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"},
+            },
+            "data": [
+                {
+                    "type": "sentinel-2-l2a",
+                    "id": "refl",
+                    "dataFilter": {
+                        "timeRange": {"from": time_from, "to": time_to},
+                        "mosaickingOrder": "leastCC",
+                    },
+                },
+                {
+                    "type": "sentinel-2-l2a",
+                    "id": "scl",
+                    "dataFilter": {
+                        "timeRange": {"from": time_from, "to": time_to},
+                        "mosaickingOrder": "leastCC",
+                    },
+                },
+            ],
         },
-        "output": {"width": width, "height": height, "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}]},
+        "output": {
+            "width": width,
+            "height": height,
+            "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}],
+        },
         "evalscript": evalscript(),
     }
     response = requests.post(PROCESS_URL, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, json=payload, timeout=900)
@@ -419,7 +445,6 @@ def normalized_difference(first, second):
 #  CORE ALGORITHM
 # ══════════════════════════════════════════════════════════════════════
 
-# ── CHANGE 4: SCL cloud/shadow masking inside LRAD ──
 def calculate_lrad(bands, q_value):
     finite = np.logical_and.reduce([
         np.isfinite(bands[b]) for b in ["B03", "B04", "B08", "B11", "B12"]
@@ -519,7 +544,6 @@ def make_spatial_mask(shape_, profile, lat=SITE_LAT, lon=SITE_LON, radius_m=SITE
     return dist_m <= radius_m, (row, col)
 
 
-# ── CHANGE 5: trimmed-std robust stats (fat-tail safe) ──
 def _robust_stats(values):
     finite = values[np.isfinite(values)]
     if finite.size == 0:
@@ -527,22 +551,18 @@ def _robust_stats(values):
 
     median = float(np.median(finite))
 
-    # Trimmed std from middle 80% (ignores contaminated tails)
     p_low = float(PARAMS["trim_low_pct"])
     p_high = float(PARAMS["trim_high_pct"])
     p_lo, p_hi = np.percentile(finite, [p_low, p_high])
     trimmed = finite[(finite >= p_lo) & (finite <= p_hi)]
     if trimmed.size > 10:
-        # For N(0, σ) truncated to [p10, p90], std ≈ 0.7817·σ
         sigma_trimmed = float(np.std(trimmed)) / 0.7817
     else:
         sigma_trimmed = 0.0
 
-    # MAD-based fallback
     mad = float(np.median(np.abs(finite - median)))
     sigma_mad = 1.4826 * mad if mad > 1e-9 else float(np.std(finite))
 
-    # Take the smaller (more conservative noise)
     if sigma_trimmed > 0:
         sigma_robust = min(sigma_trimmed, sigma_mad)
     else:
@@ -578,7 +598,6 @@ def run_algorithm(target, reference, profile):
 
     median, sigma_robust = _robust_stats(vals)
 
-    # ── CHANGE 6: threshold with percentile cap ──
     threshold_sigma = median + max(
         PARAMS["threshold_sigma"] * sigma_robust,
         PARAMS["abs_floor_ppb"],
@@ -928,7 +947,7 @@ st.markdown("""
 <div class="app-header">
     <div>
         <div class="app-title">🛰️ Sentinel-2 Methane Screening</div>
-        <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC-faithful ΔΩ (ppb) candidate detection &nbsp;|&nbsp; v4 cloud-aware</div>
+        <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC-faithful ΔΩ (ppb) candidate detection &nbsp;|&nbsp; v5 cloud-aware</div>
     </div>
     <div class="status-pill">20 m processing &nbsp;•&nbsp; Light dashboard</div>
 </div>
@@ -1385,7 +1404,6 @@ if "result" in st.session_state:
     metrics[4].metric("Regions", result["regions"])
     metrics[5].metric("Threshold", f"{result['threshold']:.2f}")
 
-    # ── Diagnostics expander (NEW) ──
     diag = result.get("diagnostics", {})
     if diag:
         with st.expander("🔍 Threshold & noise diagnostics", expanded=False):
@@ -1434,8 +1452,7 @@ if "result" in st.session_state:
                 st.download_button("⬇ Download Georeferenced PNG package", png_package, file_name=f"{key}_georeferenced_png.zip", mime="application/zip", key=f"download_png_compact_{key}", use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-    removed_pixels = max(0, int(result["initial_count"]) - int(result["final_count"]))
-    st.markdown(f'<div class="result-note"><b>Robust thresholding v4:</b> median = <b>{result["mean"]:.2f} ppb</b>, robust σ = <b>{result["std"]:.2f} ppb</b>, threshold = <b>{result["threshold"]:.2f} ppb</b>. SCL cloud/shadow masking active. Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · c = <b>{result["c"]:.4f}</b> · detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="result-note"><b>Robust thresholding v5:</b> median = <b>{result["mean"]:.2f} ppb</b>, robust σ = <b>{result["std"]:.2f} ppb</b>, threshold = <b>{result["threshold"]:.2f} ppb</b>. SCL cloud/shadow masking active. Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · c = <b>{result["c"]:.4f}</b> · detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
     d1, d2 = st.columns([1, 3], gap="small")
     with d1:
         st.download_button("⬇ Reference table CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection.csv", mime="text/csv", key="download_reference_csv_compact", use_container_width=True)
