@@ -1,6 +1,6 @@
 """Sentinel-2 methane candidate screening app.
 
-MBMC-faithful v5 (noise-aware reference selection + QA-gated S5P)
+MBMC-faithful v5.1 (coordinate search + live-coordinate display)
 • Aradkouh landfill (Tehran) as default AOI
 • Cloud cover 30% + last-30-days date defaults
 • Reference selection based on RESIDUAL SIGMA (not correlation)
@@ -8,6 +8,7 @@ MBMC-faithful v5 (noise-aware reference selection + QA-gated S5P)
 • S5P with qa_value >= 0.5 gating
 • Hard QA gating when residual sigma is physically implausible
 • 30-day time-series + visual daily playback
+• Coordinate-based AOI search with live map center/bounds readout
 • UI/design preserved.
 """
 from __future__ import annotations
@@ -68,12 +69,12 @@ SITE_RADIUS_M = 5000.0
 K_MBMP = 1.0e-5
 DETREND_SIGMA = 80.0
 ABS_FLOOR_PPB = 8.0
-N_SIGMA = 2.5                  # raised back from 1.75 — 1.75 was too permissive
+N_SIGMA = 2.5
 GAUSS_SIGMA = 10.0
 FLOOD_MIN_SIZE = 10
 DILATE_RADIUS_FINAL = 3
 SIGMA_WARN_PPB = 60.0
-N_REFERENCES = 3               # how many top refs to use in median
+N_REFERENCES = 3
 
 PARAMS = {
     "b03_quantile": 0.05,
@@ -131,7 +132,6 @@ def get_datetime(item) -> Optional[datetime]:
 def get_tile(item):
     data = as_dict(item)
     props = get_properties(data)
-    # CDSE puts tile in properties.grid:code or similar
     for key in ("grid:code", "mgrs", "s2", "tile"):
         value = props.get(key)
         if value:
@@ -145,16 +145,13 @@ def get_tile(item):
 
 
 def get_cloud(item):
-    """Return cloud cover percentage (0-100) or 100 if unknown."""
     props = get_properties(item)
-    # CDSE STAC uses eo:cloud_cover (flattened) or eo.cloud_cover
     for key in ("eo:cloud_cover", "eo", "cloudCover", "cloud_cover"):
         value = props.get(key)
         if value is None:
             continue
         try:
             if isinstance(value, dict):
-                # nested eo: {"cloud_cover": 12.3}
                 for sub in ("cloud_cover", "cloudCover"):
                     if sub in value:
                         return float(value[sub])
@@ -192,8 +189,14 @@ def ensure_aoi(obj):
     return normalize_geometry(obj) or mapping(DEFAULT_AOI)
 
 
+def coords_to_aoi(lat: float, lon: float, half_km: float = 5.0) -> dict:
+    """Build a square AOI (in degrees) centered on (lat, lon)."""
+    dlat = half_km / 111.0
+    dlon = half_km / (111.0 * max(math.cos(math.radians(lat)), 1e-6))
+    return mapping(box(lon - dlon, lat - dlat, lon + dlon, lat + dlat))
+
+
 def search_scenes(aoi, start, end, max_cloud):
-    """Search CDSE STAC. Cloud filtering done client-side for robustness."""
     payload = {
         "collections": ["sentinel-2-l2a"],
         "datetime": f"{start.isoformat()}Z/{end.isoformat()}Z",
@@ -203,7 +206,6 @@ def search_scenes(aoi, start, end, max_cloud):
     response = requests.post(f"{STAC_URL}search", json=payload, timeout=120)
     response.raise_for_status()
     features = response.json().get("features", []) or []
-    # client-side cloud filter
     filtered = [f for f in features if get_cloud(f) <= float(max_cloud)]
     return filtered
 
@@ -296,7 +298,6 @@ function evaluatePixel(sample) {
 
 
 def s5p_evalscript():
-    """S5P CH4 with QA gating. qa_value < 0.5 is masked as NaN."""
     return """//VERSION=3
 function setup() {
   return {
@@ -315,7 +316,6 @@ function evaluatePixel(sample) {
 
 
 def s5p_evalscript_fallback():
-    """Fallback if qa_value band is unavailable."""
     return """//VERSION=3
 function setup() {
   return {
@@ -434,7 +434,6 @@ def download_s5p_scene(aoi, date_from, date_to, access_token):
 
     response = _post(s5p_evalscript())
     if response.status_code >= 400:
-        # fallback without qa_value band
         response = _post(s5p_evalscript_fallback())
         if response.status_code >= 400:
             try:
@@ -573,7 +572,6 @@ def _robust_stats(values):
 
 
 def compute_dOmega_for_reference(target_bands, ref_bands, valid):
-    """Compute ΔΩ (ppb) for one reference. Returns (dOmega, c)."""
     c = calculate_c(target_bands["B11"], target_bands["B12"], valid)
     dR_t = calculate_delta_R(target_bands["B11"], target_bands["B12"], c, valid)
     dR_r = calculate_delta_R(ref_bands["B11"], ref_bands["B12"], c, valid)
@@ -583,7 +581,6 @@ def compute_dOmega_for_reference(target_bands, ref_bands, valid):
 
 
 def residual_sigma_of(dOmega, valid):
-    """Cheap score: robust sigma after detrend+smooth. Used for reference ranking."""
     detrended, _ = remove_large_scale_background(dOmega, valid, sigma=DETREND_SIGMA)
     smoothed = normalized_gaussian(detrended, valid, GAUSS_SIGMA)
     vals = smoothed[np.isfinite(smoothed)]
@@ -594,7 +591,6 @@ def residual_sigma_of(dOmega, valid):
 
 
 def run_algorithm_with_dOmega(dOmega_stack, valid, profile):
-    """Given a stack of per-reference ΔΩ (N,H,W), take pixel-wise median then threshold."""
     if dOmega_stack.shape[0] == 0:
         raise RuntimeError("No reference ΔΩ available.")
     if dOmega_stack.shape[0] == 1:
@@ -683,8 +679,18 @@ def save_raster(path, array, profile, mask=False):
 
 def create_map(aoi):
     geometry = shape(ensure_aoi(aoi))
-    fmap = folium.Map([geometry.centroid.y, geometry.centroid.x], zoom_start=11, tiles="OpenStreetMap")
-    folium.GeoJson(mapping(geometry), style_function=lambda _: {"color": "blue", "fill": False}).add_to(fmap)
+    centroid = geometry.centroid
+    fmap = folium.Map([centroid.y, centroid.x], zoom_start=11, tiles="OpenStreetMap")
+    folium.GeoJson(
+        mapping(geometry),
+        style_function=lambda _: {"color": "#1d3557", "weight": 2, "fill": False},
+    ).add_to(fmap)
+    # Add a marker at the AOI centroid so the user sees the pin
+    folium.Marker(
+        [centroid.y, centroid.x],
+        tooltip=f"AOI center<br>{centroid.y:.5f}, {centroid.x:.5f}",
+        icon=folium.Icon(color="red", icon="crosshairs", prefix="fa"),
+    ).add_to(fmap)
     Draw(export=True, draw_options={"polyline": False, "circle": False, "marker": False, "circlemarker": False}).add_to(fmap)
     return fmap
 
@@ -777,7 +783,7 @@ def georeferenced_png_package(array, profile, mask=False):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# TIME-SERIES (per-day, uses same noise-aware logic)
+# TIME-SERIES
 # ══════════════════════════════════════════════════════════════════════
 
 def process_single_day(target_scene, reference_scenes, aoi, access_token, store_image=True):
@@ -897,6 +903,8 @@ div[data-testid="stDataFrame"] * { color: #111111 !important; }
 .result-legend .legend-row { display: flex; align-items: center; gap: 0.45rem; color: #111111 !important; font-size: 0.82rem; line-height: 1.25; }
 .result-legend .legend-row span:last-child { color: #111111 !important; }
 .legend-swatch { width: 18px; height: 14px; min-width: 18px; border: 1px solid #555; border-radius: 2px; display: inline-block; }
+.coord-box { background: #111318; color: #ffffff !important; border-radius: 9px; padding: 0.55rem 0.7rem; font-family: monospace; font-size: 0.78rem; line-height: 1.5; margin-top: 0.4rem; }
+.coord-box b { color: #a8dadc !important; }
 footer { visibility: hidden; }
 .stMarkdown { margin-bottom: 0.1rem; }
 .element-container { margin-bottom: 0.15rem; }
@@ -909,25 +917,119 @@ st.markdown("""
         <div class="app-title">🛰️ Sentinel-2 Methane Screening</div>
         <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC-faithful ΔΩ (ppb) · noise-aware reference selection</div>
     </div>
-    <div class="status-pill">20 m processing &nbsp;•&nbsp; Multi-reference median &nbsp;•&nbsp; QA-gated S5P</div>
+    <div class="status-pill">20 m processing &nbsp;•&nbsp; Coordinate search &nbsp;•&nbsp; Live bounds</div>
 </div>
 """, unsafe_allow_html=True)
 
 if "aoi" not in st.session_state:
     st.session_state.aoi = mapping(DEFAULT_AOI)
 
+# ── Live coordinate state for the map ────────────────────────────────
+if "map_center" not in st.session_state:
+    st.session_state.map_center = (DEFAULT_AOI.centroid.y, DEFAULT_AOI.centroid.x)
+
 map_col, control_col = st.columns([1.65, 1.0], gap="small")
 with map_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">01 · STUDY AREA</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-title">Area of Interest</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">Draw or edit the study area directly on the map.</div>', unsafe_allow_html=True)
-    map_data = st_folium(create_map(st.session_state.aoi), height=385, width=1000, key="aoi_map")
+    st.markdown('<div class="card-caption">Draw on the map, or jump to coordinates using the search box below the map. All values update live.</div>', unsafe_allow_html=True)
+
+    map_data = st_folium(
+        create_map(st.session_state.aoi),
+        height=385,
+        width=1000,
+        key="aoi_map",
+        returned_objects=["all_drawings", "center", "bounds"],
+    )
+
+    # ── Live center / bounds readout (below map) ──────────────────────
+    live_center = None
+    live_bounds = None
+    if map_data:
+        center = map_data.get("center")
+        if isinstance(center, dict):
+            live_center = (float(center.get("lat")), float(center.get("lng")))
+        elif isinstance(center, (list, tuple)) and len(center) == 2:
+            live_center = (float(center[0]), float(center[1]))
+        bounds = map_data.get("bounds")
+        if isinstance(bounds, dict):
+            try:
+                live_bounds = (
+                    float(bounds.get("_southWest", {}).get("lat")),
+                    float(bounds.get("_southWest", {}).get("lng")),
+                    float(bounds.get("_northEast", {}).get("lat")),
+                    float(bounds.get("_northEast", {}).get("lng")),
+                )
+            except (TypeError, ValueError):
+                live_bounds = None
+        elif isinstance(bounds, (list, tuple)) and len(bounds) == 4:
+            live_bounds = tuple(float(x) for x in bounds)
+
+    if live_center is None:
+        live_center = st.session_state.map_center
+
+    # Estimate visible span
+    if live_bounds:
+        span_lat = abs(live_bounds[2] - live_bounds[0])
+        span_lon = abs(live_bounds[3] - live_bounds[1])
+    else:
+        span_lat = span_lon = 0.0
+
+    coord_html = (
+        f'<div class="coord-box">'
+        f'<b>Center:</b> {live_center[0]:.5f}°N, {live_center[1]:.5f}°E<br>'
+        f'<b>Bounds:</b> S {live_bounds[0]:.4f} · W {live_bounds[1]:.4f} · N {live_bounds[2]:.4f} · E {live_bounds[3]:.4f}<br>'
+        f'<b>Visible span:</b> ≈ {span_lat*111:.2f} km (N-S) × {span_lon*111*math.cos(math.radians(live_center[0])):.2f} km (E-W)'
+        f'</div>' if live_bounds else
+        f'<div class="coord-box"><b>Center:</b> {live_center[0]:.5f}°N, {live_center[1]:.5f}°E<br>'
+        f'<b>Bounds:</b> pan/zoom the map to see live bounds</div>'
+    )
+    st.markdown(coord_html, unsafe_allow_html=True)
+
+    st.session_state.map_center = live_center
+
+    # ── Coordinate search: pan/zoom map to a given lat,lon ────────────
+    st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">COORDINATE SEARCH</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">Type coordinates as <b>lat, lon</b> (e.g. <code>31.805489, 6.154881</code>) and press Enter to center the map and build a 10×10 km AOI around it.</div>', unsafe_allow_html=True)
+
+    cc1, cc2 = st.columns([3, 1], gap="small")
+    with cc1:
+        coord_input = st.text_input(
+            "Coordinate search",
+            placeholder="31.805489, 6.154881",
+            label_visibility="collapsed",
+            key="coord_search_input",
+        )
+    with cc2:
+        coord_go = st.button("🔍  Go", use_container_width=True, key="coord_search_go", type="primary")
+
+    if coord_go or (coord_input and st.session_state.get("_last_coord_input") != coord_input):
+        st.session_state["_last_coord_input"] = coord_input
+        try:
+            cleaned = coord_input.replace("°", " ").replace(",", " ")
+            parts = [p for p in cleaned.split() if p]
+            if len(parts) < 2:
+                raise ValueError("Need two numbers: latitude, longitude")
+            lat = float(parts[0])
+            lon = float(parts[1])
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                raise ValueError("Latitude must be in [-90, 90] and longitude in [-180, 180]")
+            new_aoi = coords_to_aoi(lat, lon, half_km=5.0)
+            st.session_state.aoi = new_aoi
+            st.session_state.map_center = (lat, lon)
+            st.success(f"Map centered at {lat:.5f}, {lon:.5f} · AOI = 10×10 km square")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Invalid coordinate format: {exc}")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
     if map_data and map_data.get("all_drawings"):
         new_aoi = normalize_geometry({"type": "FeatureCollection", "features": map_data["all_drawings"]})
         if new_aoi:
             st.session_state.aoi = new_aoi
-    st.markdown('</div>', unsafe_allow_html=True)
 
 with control_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
@@ -955,15 +1057,12 @@ with control_col:
                     datetime.combine(end_date, datetime.max.time()),
                     max_cloud,
                 )
-
             if search_results is None:
                 search_results = []
             elif not isinstance(search_results, list):
                 search_results = list(search_results)
-
             st.session_state["scene_results"] = search_results
             st.session_state.pop("target", None)
-
             if search_results:
                 st.success(f"{len(search_results)} scene(s) found")
             else:
@@ -1136,7 +1235,6 @@ with action_col:
                         st.error("LRAD removed nearly all pixels. Relax thresholds or enlarge AOI.")
                         st.stop()
 
-                    # ── Score each reference by residual sigma ──
                     total_refs = max(1, len(references))
                     reference_rows = []
                     scored_refs = []
@@ -1165,7 +1263,6 @@ with action_col:
 
                         dOmega, _ = compute_dOmega_for_reference(target_bands, ref_bands, valid)
                         sigma, _, _ = residual_sigma_of(dOmega, valid)
-
                         valid_count = int(np.isfinite(dOmega).sum())
                         reference_rows.append({
                             "id": as_dict(reference).get("id"),
@@ -1235,7 +1332,6 @@ with action_col:
                     progress.progress(100, text="Ready · outputs are ready")
                     st.success("Processing completed")
 
-                    # ── QA warnings ────────────────────────────────────
                     if result["is_noise_dominated"]:
                         st.error(
                             f"🚫 **INVALID RESULT — noise-dominated.**\n\n"
@@ -1596,7 +1692,7 @@ if "result" in st.session_state:
                 st.markdown(legend_html("s5p"), unsafe_allow_html=True)
             st.markdown(
                 '<div class="card-caption">Each pixel is shown as deviation from the local mean '
-                '(red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill '
+                '(red = above, blue = below). At TROPOMI\'s ~9 km resolution, a small landfill '
                 'may only occupy 1–2 pixels. Values are <b>not</b> column-averaged mixing ratios '
                 'in ppb — they are the raw CH4 product scaled by the CDSE Process API.</div>',
                 unsafe_allow_html=True,
