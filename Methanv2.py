@@ -49,6 +49,8 @@ from streamlit_folium import st_folium
 # ── Deep Learning imports ──
 try:
     import torch
+    torch.classes.__path__ = []  # رفع تداخل Streamlit و PyTorch
+    import streamlit as st
     import torch.nn as nn
     import torch.nn.functional as F
     from torch.utils.data import Dataset, DataLoader
