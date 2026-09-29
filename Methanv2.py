@@ -1,18 +1,14 @@
-"""
-Sentinel-2 Methane Detection App — SimCLR-based (ISPRS 2026 Paper Implementation)
-================================================================================
-UI/UX preserved from original app. Algorithm replaced with:
-- Self-Supervised Learning (SimCLR) for representation learning
-- Fine-tuning for binary plume segmentation
-- Integrated Mass Enhancement (IME) for emission quantification
+"""Sentinel-2 methane candidate screening app.
 
-References:
-- Paper: "A Self-Supervised Learning Framework for Methane Emission Detection Using Sentinel-2"
-- SimCLR: Chen et al., 2020
-- MBMP: Varon et al., 2021
-- IME: Varon et al., 2018
+MBMC-faithful v5 (cloud-aware, robust threshold, multi-datasource fix)
+   SCL-based cloud & shadow masking via two-datasource evalscript
+   Trimmed-std robust noise estimation (fat-tail safe)
+   Percentile-capped threshold (prevents runaway σ)
+   Location search (Nominatim) + jump-to-location + coordinates panel
+   Aradkouh landfill (Tehran) as default AOI
+   30-day time-series + visual daily playback
+   Sentinel-5P CH4 context layer
 """
-
 from __future__ import annotations
 
 import io
@@ -21,11 +17,9 @@ import math
 import re
 import hashlib
 import time
-import copy
-import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional
 
 import folium
 import numpy as np
@@ -46,65 +40,63 @@ from shapely.ops import unary_union
 from skimage.morphology import disk
 from streamlit_folium import st_folium
 
-# ── Deep Learning imports ──
-import traceback
-
-try:
-    import torch
-    torch.classes.__path__ = []   # رفع تداخل معروف Streamlit + PyTorch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from torch.utils.data import Dataset, DataLoader
-    import torchvision.transforms as T
-    from torchvision import models
-    import timm
-    TORCH_AVAILABLE = True
-except Exception as e:
-    TORCH_AVAILABLE = False
-    st.error(f"PyTorch import failed: {type(e).__name__}: {e}")
-    st.code(traceback.format_exc())
-
-warnings.filterwarnings("ignore")
-
 STAC_URL = "https://stac.dataspace.copernicus.eu/v1/"
 TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 
+# ── SCL added to bands for cloud/shadow masking ──
 BANDS = ["B03", "B04", "B08", "B11", "B12", "SCL"]
 RESOLUTION = 20
 CACHE_DIR = Path.home() / ".sentinel_methane_cache"
 RESULT_DIR = Path.home() / ".sentinel_methane_results"
-MODEL_DIR = Path.home() / ".sentinel_methane_models"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 S5P_COLLECTION = "sentinel-5p-l2"
+
 DEFAULT_AOI = box(51.20, 35.40, 51.45, 35.60)
 
-# ── SimCLR Hyperparameters (from paper) ──
-SIMCLR_TEMPERATURE = 0.5          # tau
-SIMCLR_PROJ_DIM = 256             # projection head units
-SIMCLR_EPOCHS = 50                # pretraining epochs (paper doesn't specify exactly; use 50 for demo)
-SIMCLR_BATCH_SIZE = 64
-SIMCLR_LR = 3e-4
-FINETUNE_EPOCHS = 30
-WARMUP_EPOCHS = 10                # frozen encoder epochs
-FINETUNE_LR = 1e-4
-ENCODER_LR_FACTOR = 0.1           # lower LR for encoder during joint training
-TILE_SIZE = 256
-PATCH_SIZE = 256                  # Sentinel-2 tile size
-NUM_CLASSES = 2                   # plume / non-plume
+SITE_LAT = 35.505
+SITE_LON = 51.330
+SITE_RADIUS_M = 5000.0
 
-# ── IME Constants ──
-CH4_MOLAR_MASS = 0.01604          # kg/mol
-# Effective wind speed calibration (Guanter et al. 2021, used in paper)
-# U_eff = 0.34 * U10 + 0.44  (m/s)
-WIND_COEFF_A = 0.34
-WIND_COEFF_B = 0.44
+# ── Tuned MBMC constants ──
+K_MBMP = 1.0e-5
+DETREND_SIGMA = 200.0
+ABS_FLOOR_PPB = 20.0
+N_SIGMA = 2.0
+GAUSS_SIGMA = 5.0
+FLOOD_MIN_SIZE = 10
+DILATE_RADIUS_FINAL = 3
+
+PARAMS = {
+    "b03_quantile": 0.05,
+    "swir_saturation": 1.0,
+    "ndwi_threshold": 0.20,
+    "ndvi_threshold": 0.45,
+    "ndbi_threshold": 0.40,
+    "ndsi_threshold": 0.42,
+    "lrad_dilation": 1,
+    "gaussian_sigma": GAUSS_SIGMA,
+    "threshold_sigma": N_SIGMA,
+    "min_component_pixels": FLOOD_MIN_SIZE,
+    "final_dilation": DILATE_RADIUS_FINAL,
+    "min_solidity": 0.0,
+    "b12_epsilon": 1e-6,
+    "min_valid_ref_pixels": 50,
+    "abs_floor_ppb": ABS_FLOOR_PPB,
+    "detrend_sigma": DETREND_SIGMA,
+    "k_mbmp": K_MBMP,
+    "max_plume_area_km2": 10.0,
+    "site_radius_m": SITE_RADIUS_M,
+    "threshold_percentile_cap": 99.0,
+    "trim_low_pct": 10.0,
+    "trim_high_pct": 90.0,
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════
-#  HELPERS (unchanged from original)
+#  HELPERS
 # ══════════════════════════════════════════════════════════════════════════
 
 def as_dict(item):
@@ -180,6 +172,7 @@ def ensure_aoi(obj):
 
 
 def geocode_location(query: str):
+    """Geocode a location name using Nominatim (OpenStreetMap)."""
     try:
         response = requests.get(
             "https://nominatim.openstreetmap.org/search",
@@ -284,11 +277,8 @@ def get_access_token():
     raise RuntimeError("Your Copernicus session expired. Please log in again.")
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  EVALSCRIPTS
-# ══════════════════════════════════════════════════════════════════════════
-
-def evalscript_s2():
+# ── FIX: two-datasource evalscript (reflectance + SCL) ──
+def evalscript():
     return """//VERSION=3
 function setup() {
   return {
@@ -321,21 +311,14 @@ function evaluatePixel(sample) {
 """
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  DATA DOWNLOAD
-# ══════════════════════════════════════════════════════════════════════════
-
-def download_scene(item, aoi, access_token, return_array=False):
-    """Download Sentinel-2 scene bands for AOI. Returns path or array."""
+def download_scene(item, aoi, access_token):
     item = as_dict(item)
     aoi = ensure_aoi(aoi)
-    cache_id = hashlib.sha256(json.dumps([item.get("id"), aoi, RESOLUTION, "simclr_v1"], sort_keys=True).encode()).hexdigest()[:24]
+    cache_id = hashlib.sha256(json.dumps([item.get("id"), aoi, RESOLUTION, "v5"], sort_keys=True).encode()).hexdigest()[:24]
     folder = CACHE_DIR / cache_id
     output_path = folder / "bands.tif"
     metadata_path = folder / "metadata.json"
     if output_path.exists() and metadata_path.exists():
-        if return_array:
-            return read_stack(output_path)
         return output_path
     folder.mkdir(parents=True, exist_ok=True)
     minx, miny, maxx, maxy = shape(aoi).bounds
@@ -346,6 +329,7 @@ def download_scene(item, aoi, access_token, return_array=False):
     if acquisition is None:
         raise RuntimeError("Could not read acquisition date.")
 
+    # ── FIX: two data objects with distinct ids (refl + scl) ──
     time_from = acquisition.strftime("%Y-%m-%dT00:00:00Z")
     time_to = (acquisition + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
     payload = {
@@ -378,7 +362,7 @@ def download_scene(item, aoi, access_token, return_array=False):
             "height": height,
             "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}],
         },
-        "evalscript": evalscript_s2(),
+        "evalscript": evalscript(),
     }
     response = requests.post(PROCESS_URL, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, json=payload, timeout=900)
     if response.status_code >= 400:
@@ -389,8 +373,6 @@ def download_scene(item, aoi, access_token, return_array=False):
         raise RuntimeError(f"CDSE Process API failed ({response.status_code}): {detail}")
     output_path.write_bytes(response.content)
     metadata_path.write_text(json.dumps(item, indent=2), encoding="utf-8")
-    if return_array:
-        return read_stack(output_path)
     return output_path
 
 
@@ -451,501 +433,239 @@ def read_stack(path):
     return {band: array[index] for index, band in enumerate(BANDS)}, profile
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  SIMCLR DATASET & AUGMENTATION
-# ══════════════════════════════════════════════════════════════════════════
-
-class Sentinel2TileDataset(Dataset):
-    """
-    Dataset for SimCLR pretraining on unlabeled Sentinel-2 tiles.
-    Each item is a 6-channel image (B03, B04, B08, B11, B12, SCL).
-    Augmentations: random zoom, rotation, flip, translation, cutout.
-    """
-    def __init__(self, tiles: np.ndarray, transform=None):
-        # tiles shape: (N, 6, H, W)
-        self.tiles = tiles.astype(np.float32)
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.tiles)
-
-    def __getitem__(self, idx):
-        img = torch.from_numpy(self.tiles[idx])
-        if self.transform:
-            x1 = self.transform(img)
-            x2 = self.transform(img)
-            return x1, x2
-        return img, img
-
-
-class SimCLRAugmentation:
-    """
-    SimCLR augmentation pipeline for Sentinel-2 tiles.
-    Paper: random zoom, rotation, horizontal and vertical flipping,
-    translation, and cutout operations applied independently and stochastically.
-    """
-    def __init__(self, size=TILE_SIZE):
-        self.size = size
-        # Spatial transforms only (paper focuses on spatial transformations)
-        self.spatial = T.Compose([
-            T.RandomResizedCrop(size, scale=(0.6, 1.0), ratio=(0.75, 1.33)),
-            T.RandomHorizontalFlip(p=0.5),
-            T.RandomVerticalFlip(p=0.5),
-            T.RandomRotation(degrees=90),
-        ])
-        self.cutout = T.RandomErasing(p=0.5, scale=(0.02, 0.15), ratio=(0.3, 3.3))
-
-    def __call__(self, img):
-        # img: (C, H, W) tensor
-        img = self.spatial(img)
-        img = self.cutout(img)
-        return img
+def normalized_difference(first, second):
+    output = np.full(first.shape, np.nan, dtype=np.float32)
+    denominator = first + second
+    valid = np.isfinite(first) & np.isfinite(second) & (np.abs(denominator) > 1e-12)
+    output[valid] = (first[valid] - second[valid]) / denominator[valid]
+    return output
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  SIMCLR MODEL: ENCODER + PROJECTION HEAD
+#  CORE ALGORITHM
 # ══════════════════════════════════════════════════════════════════════════
 
-class ProjectionHead(nn.Module):
-    """
-    Projection head: 3-layer MLP with 256 units each and ReLU.
-    Paper: Section 2.2.3
-    """
-    def __init__(self, in_dim, hidden_dim=SIMCLR_PROJ_DIM, out_dim=128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class SimCLRModel(nn.Module):
-    """
-    SimCLR model: encoder backbone + projection head.
-    Supports multiple backbones: MobileNet, Inception-v3, DenseNet-121,
-    Xception, ViT, SwinT.
-    """
-    def __init__(self, backbone_name="mobilenet_v3_small", proj_dim=SIMCLR_PROJ_DIM, pretrained=True):
-        super().__init__()
-        self.backbone_name = backbone_name
-        self.encoder, self.feat_dim = self._build_encoder(backbone_name, pretrained)
-        self.projection_head = ProjectionHead(self.feat_dim, hidden_dim=proj_dim)
-
-    def _build_encoder(self, name, pretrained):
-        """Build encoder backbone and return (module, feature_dim)."""
-        name_lower = name.lower().replace("-", "_").replace(" ", "_")
-
-        if "mobilenet" in name_lower:
-            # MobileNetV3 Small
-            base = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None)
-            # Remove classifier; use features + avgpool
-            encoder = nn.Sequential(*list(base.features.children()), nn.AdaptiveAvgPool2d(1), nn.Flatten())
-            feat_dim = 576  # MobileNetV3 Small output channels
-        elif "inception" in name_lower:
-            base = models.inception_v3(weights=models.Inception_V3_Weights.DEFAULT if pretrained else None, aux_logits=False)
-            # Remove fc
-            encoder = nn.Sequential(*list(base.children())[:-1], nn.AdaptiveAvgPool2d(1), nn.Flatten())
-            feat_dim = 2048
-        elif "densenet" in name_lower:
-            base = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT if pretrained else None)
-            encoder = nn.Sequential(base.features, nn.AdaptiveAvgPool2d(1), nn.Flatten())
-            feat_dim = 1024
-        elif "xception" in name_lower:
-            # Use timm for Xception
-            try:
-                base = timm.create_model("xception", pretrained=pretrained, num_classes=0, global_pool="avg")
-                encoder = base
-                feat_dim = base.num_features
-            except Exception:
-                # Fallback to ResNet50 if xception unavailable
-                st.warning("Xception not available in timm, falling back to ResNet50")
-                base = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
-                encoder = nn.Sequential(*list(base.children())[:-1], nn.Flatten())
-                feat_dim = 2048
-        elif "vit" in name_lower:
-            base = timm.create_model("vit_base_patch16_224", pretrained=pretrained, num_classes=0, global_pool="avg")
-            encoder = base
-            feat_dim = base.num_features
-        elif "swin" in name_lower:
-            base = timm.create_model("swin_tiny_patch4_window7_224", pretrained=pretrained, num_classes=0, global_pool="avg")
-            encoder = base
-            feat_dim = base.num_features
-        else:
-            raise ValueError(f"Unknown backbone: {name}")
-
-        return encoder, feat_dim
-
-    def forward(self, x):
-        # x: (B, C, H, W)
-        h = self.encoder(x)
-        z = self.projection_head(h)
-        return h, z
-
-
-# ── NT-Xent Loss ──
-
-def nt_xent_loss(z1, z2, temperature=SIMCLR_TEMPERATURE):
-    """
-    Normalized Temperature-scaled Cross Entropy Loss (Equation 1 in paper).
-    z1, z2: (B, D) - projections of two augmented views.
-    """
-    B = z1.size(0)
-    z1 = F.normalize(z1, dim=1)
-    z2 = F.normalize(z2, dim=1)
-    z = torch.cat([z1, z2], dim=0)  # (2B, D)
-
-    sim_matrix = torch.matmul(z, z.T) / temperature  # (2B, 2B)
-
-    # Mask self-similarity
-    mask = torch.eye(2 * B, dtype=torch.bool, device=z.device)
-    sim_matrix.masked_fill_(mask, -1e9)
-
-    # Positive pairs: (i, i+B) and (i+B, i)
-    targets = torch.arange(2 * B, device=z.device)
-    targets[:B] = targets[:B] + B
-    targets[B:] = targets[B:] - B
-
-    loss = F.cross_entropy(sim_matrix, targets)
-    return loss
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  DECODER (Figure 3 in paper)
-# ══════════════════════════════════════════════════════════════════════════
-
-class Decoder(nn.Module):
-    """
-    Decoder: Flatten -> Dense -> Reshape -> ConvTranspose + ReLU + BN
-    Architecture from Figure 3 of the paper.
-    Output: single-channel binary segmentation map.
-    """
-    def __init__(self, in_feat_dim, initial_spatial=7, out_channels=1):
-        super().__init__()
-        self.initial_spatial = initial_spatial
-        self.fc = nn.Sequential(
-            nn.Linear(in_feat_dim, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, 512 * initial_spatial * initial_spatial),
-            nn.ReLU(inplace=True),
-        )
-        self.deconv = nn.Sequential(
-            # 7x7 -> 14x14
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            # 14x14 -> 28x28
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            # 28x28 -> 56x56
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            # 56x56 -> 112x112
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            # 112x112 -> 224x224
-            nn.ConvTranspose2d(32, out_channels, kernel_size=4, stride=2, padding=1),
-        )
-
-    def forward(self, x):
-        x = self.fc(x)
-        x = x.view(-1, 512, self.initial_spatial, self.initial_spatial)
-        x = self.deconv(x)
-        return x
-
-
-class SegmentationModel(nn.Module):
-    """Encoder + Decoder for plume segmentation."""
-    def __init__(self, encoder, feat_dim, initial_spatial=7):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = Decoder(feat_dim, initial_spatial=initial_spatial)
-
-    def forward(self, x):
-        h = self.encoder(x)  # (B, feat_dim)
-        return self.decoder(h)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  MBMP BASELINE (for automatic labeling / comparison)
-# ══════════════════════════════════════════════════════════════════════════
-
-def mbmp_enhancement(target_bands, reference_bands):
-    """
-    MBMP enhancement (Varon et al., 2021).
-    ΔΩ_MBMP = (δ12 * B12^t - δ11 * B11^t) / (δ11 * B11^t) - same for reference
-    where δ are normalization coefficients computed via regression.
-    Returns enhancement map in ppb (approximate).
-    """
-    B11_t = target_bands["B11"]
-    B12_t = target_bands["B12"]
-    B11_r = reference_bands["B11"]
-    B12_r = reference_bands["B12"]
-
-    # Compute normalization coefficients via regression on valid pixels
-    valid = (np.isfinite(B11_t) & np.isfinite(B12_t) &
-             np.isfinite(B11_r) & np.isfinite(B12_r) &
-             (B11_t > 0.05) & (B12_t > 0.05) &
-             (B11_r > 0.05) & (B12_r > 0.05))
-
-    if valid.sum() < 100:
-        return np.full_like(B11_t, np.nan)
-
-    x = B12_t[valid]
-    y = B11_t[valid]
-    delta_11, delta_12 = np.polyfit(x, y, 1)
-
-    dOmega_t = (delta_12 * B12_t - delta_11 * B11_t) / (delta_11 * B11_t)
-    dOmega_r = (delta_12 * B12_r - delta_11 * B11_r) / (delta_11 * B11_r)
-    dOmega = dOmega_t - dOmega_r
-
-    # Convert to ppb (approximate scaling)
-    K_MBMP = 1e-5
-    return dOmega / K_MBMP
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  IME QUANTIFICATION
-# ══════════════════════════════════════════════════════════════════════════
-
-def compute_ime(plume_mask, enhancement_map, pixel_area_m2=None):
-    """
-    Integrated Mass Enhancement (IME).
-    IME = sum_j (ΔΩ_j * A_j)  [kg]
-    where ΔΩ is column enhancement [kg/m²] and A_j is pixel area [m²].
-    """
-    if pixel_area_m2 is None:
-        pixel_area_m2 = RESOLUTION * RESOLUTION  # 20m x 20m
-
-    # ΔΩ is in ppb; convert to kg/m²
-    # 1 ppb CH4 ≈ 2.69e-9 kg/m² (approximate at surface)
-    PPB_TO_KG_M2 = 2.69e-9
-    delta_omega = enhancement_map[plume_mask] * PPB_TO_KG_M2
-
-    if delta_omega.size == 0:
-        return 0.0
-
-    ime = np.nansum(delta_omega) * pixel_area_m2
-    return float(ime)
-
-
-def compute_emission_rate(plume_mask, enhancement_map, wind_speed_10m, pixel_area_m2=None):
-    """
-    Estimate CH4 emission rate Q using IME method.
-    Q = U_eff * IME / L
-    where L = sqrt(plume_area) (characteristic plume size),
-    U_eff = 0.34 * U10 + 0.44 (Guanter et al. 2021).
-    Returns Q in kg/h.
-    """
-    if pixel_area_m2 is None:
-        pixel_area_m2 = RESOLUTION * RESOLUTION
-
-    ime = compute_ime(plume_mask, enhancement_map, pixel_area_m2)
-    plume_area = np.sum(plume_mask) * pixel_area_m2
-    if plume_area <= 0:
-        return 0.0, 0.0, 0.0
-
-    L = math.sqrt(plume_area)  # characteristic length [m]
-    U_eff = WIND_COEFF_A * wind_speed_10m + WIND_COEFF_B  # m/s
-
-    # Q = U_eff * IME / L  [kg/s]
-    Q_kg_s = U_eff * ime / L
-    Q_kg_h = Q_kg_s * 3600.0
-
-    return Q_kg_h, ime, L
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  TRAINING PIPELINE
-# ══════════════════════════════════════════════════════════════════════════
-
-def prepare_tiles_from_scenes(scenes, aoi, access_token, progress_bar=None):
-    """Download scenes and extract 256x256 tiles for training."""
-    tiles = []
-    total = len(scenes)
-    for i, scene in enumerate(scenes):
-        try:
-            if progress_bar:
-                progress_bar.progress((i + 1) / total, text=f"Downloading tile {i+1}/{total}…")
-            bands, profile = download_scene(scene, aoi, access_token, return_array=True)
-            # Stack bands into (6, H, W)
-            stacked = np.stack([bands[b] for b in BANDS], axis=0)
-            # Normalize reflectance to [0, 1] range for B03-B12
-            stacked[:5] = np.clip(stacked[:5], 0, 1)
-            # SCL is categorical, keep as is
-            stacked[5] = np.clip(stacked[5], 0, 11)
-            # Crop/resize to 256x256
-            H, W = stacked.shape[1], stacked.shape[2]
-            if H > TILE_SIZE or W > TILE_SIZE:
-                # Center crop
-                top = (H - TILE_SIZE) // 2
-                left = (W - TILE_SIZE) // 2
-                stacked = stacked[:, top:top+TILE_SIZE, left:left+TILE_SIZE]
-            elif H < TILE_SIZE or W < TILE_SIZE:
-                # Pad
-                pad_h = max(0, TILE_SIZE - H)
-                pad_w = max(0, TILE_SIZE - W)
-                stacked = np.pad(stacked, ((0,0),(0,pad_h),(0,pad_w)), mode='reflect')
-            tiles.append(stacked)
-        except Exception as e:
-            print(f"Failed to download scene {i}: {e}")
-            continue
-    return np.array(tiles)
-
-
-def pretrain_simclr(tiles, backbone_name, epochs=SIMCLR_EPOCHS, batch_size=SIMCLR_BATCH_SIZE,
-                    lr=SIMCLR_LR, device="cpu"):
-    """Pretrain SimCLR model on unlabeled tiles."""
-    if not TORCH_AVAILABLE:
-        raise RuntimeError("PyTorch not available.")
-
-    augment = SimCLRAugmentation(TILE_SIZE)
-    dataset = Sentinel2TileDataset(tiles, transform=augment)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-
-    model = SimCLRModel(backbone_name, pretrained=True)
-    model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    losses = []
-    for epoch in range(epochs):
-        model.train()
-        epoch_loss = 0.0
-        for x1, x2 in loader:
-            x1, x2 = x1.to(device), x2.to(device)
-            _, z1 = model(x1)
-            _, z2 = model(x2)
-            loss = nt_xent_loss(z1, z2)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-        avg_loss = epoch_loss / max(1, len(loader))
-        losses.append(avg_loss)
-        if (epoch + 1) % 10 == 0:
-            print(f"[SimCLR] Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f}")
-
-    return model, losses
-
-
-def fine_tune_segmentation(pretrained_encoder, tiles, labels, feat_dim,
-                           epochs=FINETUNE_EPOCHS, warmup_epochs=WARMUP_EPOCHS,
-                           batch_size=16, lr=FINETUNE_LR, device="cpu"):
-    """
-    Fine-tune segmentation model.
-    Two-stage training (Figure 4):
-    - Stage 1: frozen encoder, train decoder for warmup_epochs
-    - Stage 2: joint fine-tuning with lower LR for encoder
-    """
-    if not TORCH_AVAILABLE:
-        raise RuntimeError("PyTorch not available.")
-
-    # Create segmentation model
-    model = SegmentationModel(pretrained_encoder, feat_dim)
-    model.to(device)
-
-    # Dataset
-    dataset = torch.utils.data.TensorDataset(
-        torch.from_numpy(tiles).float(),
-        torch.from_numpy(labels).float().unsqueeze(1)
-    )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-
-    criterion = nn.BCEWithLogitsLoss()
-
-    # Stage 1: Frozen encoder, train decoder only
-    for param in model.encoder.parameters():
-        param.requires_grad = False
-    optimizer = torch.optim.Adam(model.decoder.parameters(), lr=lr)
-
-    for epoch in range(warmup_epochs):
-        model.train()
-        epoch_loss = 0.0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            out = model(x)
-            # Resize output to match label size
-            if out.shape[-2:] != y.shape[-2:]:
-                out = F.interpolate(out, size=y.shape[-2:], mode='bilinear', align_corners=False)
-            loss = criterion(out, y)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-        print(f"[Fine-tune Stage 1] Epoch {epoch+1}/{warmup_epochs} - Loss: {epoch_loss/max(1,len(loader)):.4f}")
-
-    # Stage 2: Joint fine-tuning
-    for param in model.encoder.parameters():
-        param.requires_grad = True
-    optimizer = torch.optim.Adam([
-        {'params': model.encoder.parameters(), 'lr': lr * ENCODER_LR_FACTOR},
-        {'params': model.decoder.parameters(), 'lr': lr},
+def calculate_lrad(bands, q_value):
+    finite = np.logical_and.reduce([
+        np.isfinite(bands[b]) for b in ["B03", "B04", "B08", "B11", "B12"]
     ])
 
-    for epoch in range(epochs - warmup_epochs):
-        model.train()
-        epoch_loss = 0.0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            out = model(x)
-            if out.shape[-2:] != y.shape[-2:]:
-                out = F.interpolate(out, size=y.shape[-2:], mode='bilinear', align_corners=False)
-            loss = criterion(out, y)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-        print(f"[Fine-tune Stage 2] Epoch {epoch+1}/{epochs-warmup_epochs} - Loss: {epoch_loss/max(1,len(loader)):.4f}")
+    # SCL classes to reject:
+    #   0=no_data, 1=saturated, 3=cloud_shadow,
+    #   8=cloud_medium_prob, 9=cloud_high_prob, 10=thin_cirrus, 11=snow
+    scl = bands.get("SCL")
+    if scl is not None:
+        scl_int = np.round(np.nan_to_num(scl, nan=0.0)).astype(np.int32)
+        bad_scl = np.isin(scl_int, [0, 1, 3, 8, 9, 10, 11])
+        finite &= ~bad_scl
 
-    return model
+    artifact = ((bands["B11"] >= PARAMS["swir_saturation"]) &
+                (bands["B12"] >= PARAMS["swir_saturation"]))
+    artifact |= bands["B03"] <= q_value
+    artifact |= normalized_difference(bands["B03"], bands["B08"]) >= PARAMS["ndwi_threshold"]
+    artifact |= normalized_difference(bands["B08"], bands["B04"]) >= PARAMS["ndvi_threshold"]
+    artifact |= normalized_difference(bands["B11"], bands["B08"]) >= PARAMS["ndbi_threshold"]
+    artifact |= normalized_difference(bands["B03"], bands["B11"]) >= PARAMS["ndsi_threshold"]
+    artifact |= ~finite
+
+    if PARAMS["lrad_dilation"] > 0:
+        artifact = binary_dilation(artifact, iterations=int(PARAMS["lrad_dilation"]))
+    return finite & ~artifact
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  INFERENCE
-# ══════════════════════════════════════════════════════════════════════════
+def calculate_c(b11, b12, valid):
+    """c = Σ(B11·B12) / Σ(B12²)."""
+    use = valid & np.isfinite(b11) & np.isfinite(b12) & (b11 > 0.05) & (b12 > 0.05)
+    if use.sum() < 100:
+        return 1.0
+    x = b12[use].astype(np.float64)
+    y = b11[use].astype(np.float64)
+    denom = float(np.sum(x * x))
+    if denom <= 0:
+        return 1.0
+    return float(np.sum(y * x) / denom)
 
-def predict_plume_mask(model, bands, device="cpu", threshold=0.5):
-    """Run segmentation model on a single tile."""
-    model.eval()
-    # Prepare input
-    stacked = np.stack([bands[b] for b in BANDS], axis=0)
-    stacked[:5] = np.clip(stacked[:5], 0, 1)
-    stacked[5] = np.clip(stacked[5], 0, 11)
-    H, W = stacked.shape[1], stacked.shape[2]
-    if H != TILE_SIZE or W != TILE_SIZE:
-        # Resize
-        tensor = torch.from_numpy(stacked).unsqueeze(0).float()
-        tensor = F.interpolate(tensor, size=(TILE_SIZE, TILE_SIZE), mode='bilinear', align_corners=False)
+
+def calculate_delta_R(b11, b12, c, valid):
+    """ΔR = (c·B12 − B11) / B12."""
+    output = np.full(b11.shape, np.nan, dtype=np.float32)
+    use = (
+        valid
+        & np.isfinite(b11) & np.isfinite(b12)
+        & (b11 > 0.05) & (b11 < 0.9)
+        & (b12 > 0.05) & (b12 < 0.9)
+    )
+    output[use] = (c * b12[use] - b11[use]) / b12[use]
+    return output
+
+
+def remove_large_scale_background(dOmega, valid_mask, sigma=DETREND_SIGMA):
+    finite_valid = valid_mask & np.isfinite(dOmega)
+    d = np.where(finite_valid, dOmega, 0.0).astype(np.float64)
+    w = finite_valid.astype(np.float32)
+    ds = gaussian_filter(d, sigma=sigma)
+    ws = gaussian_filter(w, sigma=sigma)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        background = ds / ws
+    background[ws < 0.1] = 0.0
+    residual = dOmega - background
+    residual[~valid_mask] = np.nan
+    return residual.astype(np.float32), background.astype(np.float32)
+
+
+def normalized_gaussian(data, valid_mask, sigma):
+    finite_valid = valid_mask & np.isfinite(data)
+    d = np.where(finite_valid, data, 0.0).astype(np.float64)
+    w = finite_valid.astype(np.float32)
+    ds = gaussian_filter(d, sigma=sigma)
+    ws = gaussian_filter(w, sigma=sigma)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        output = ds / ws
+    output[ws < 0.1] = np.nan
+    return output.astype(np.float32)
+
+
+def make_spatial_mask(shape_, profile, lat=SITE_LAT, lon=SITE_LON, radius_m=SITE_RADIUS_M):
+    transform = profile["transform"]
+    crs = profile["crs"]
+    try:
+        xs, ys = rio_transform("EPSG:4326", crs, [lon], [lat])
+    except Exception:
+        xs, ys = [lon], [lat]
+    row, col = rasterio.transform.rowcol(transform, xs[0], ys[0])
+    row = int(row); col = int(col)
+    h, w = shape_
+    if not (0 <= row < h and 0 <= col < w):
+        return np.ones(shape_, dtype=bool), (row, col)
+    rows, cols = np.ogrid[:h, :w]
+    px = abs(transform.a)
+    py = abs(transform.e)
+    dist_m = np.sqrt(((rows - row) * py) ** 2 + ((cols - col) * px) ** 2)
+    return dist_m <= radius_m, (row, col)
+
+
+def _robust_stats(values):
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return 0.0, 1.0
+
+    median = float(np.median(finite))
+
+    p_low = float(PARAMS["trim_low_pct"])
+    p_high = float(PARAMS["trim_high_pct"])
+    p_lo, p_hi = np.percentile(finite, [p_low, p_high])
+    trimmed = finite[(finite >= p_lo) & (finite <= p_hi)]
+    if trimmed.size > 10:
+        sigma_trimmed = float(np.std(trimmed)) / 0.7817
     else:
-        tensor = torch.from_numpy(stacked).unsqueeze(0).float()
+        sigma_trimmed = 0.0
 
-    with torch.no_grad():
-        tensor = tensor.to(device)
-        logits = model(tensor)
-        probs = torch.sigmoid(logits)
-        mask = (probs > threshold).squeeze().cpu().numpy()
+    mad = float(np.median(np.abs(finite - median)))
+    sigma_mad = 1.4826 * mad if mad > 1e-9 else float(np.std(finite))
 
-    # Resize mask back to original size
-    if mask.shape != (H, W):
-        mask = np.array(torch.nn.functional.interpolate(
-            torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).float(),
-            size=(H, W), mode='nearest'
-        ).squeeze().bool())
+    if sigma_trimmed > 0:
+        sigma_robust = min(sigma_trimmed, sigma_mad)
+    else:
+        sigma_robust = sigma_mad
 
-    return mask
+    if not np.isfinite(sigma_robust) or sigma_robust <= 0:
+        sigma_robust = 1.0
+
+    return median, sigma_robust
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  UTILITY FUNCTIONS (for results display)
-# ══════════════════════════════════════════════════════════════════════════
+def run_algorithm(target, reference, profile):
+    target_q = float(np.nanquantile(target["B03"], PARAMS["b03_quantile"]))
+    valid = calculate_lrad(target, target_q)
+    if valid.sum() < 100:
+        raise RuntimeError("LRAD removed nearly all pixels. Relax thresholds or enlarge AOI.")
+
+    c = calculate_c(target["B11"], target["B12"], valid)
+    dR_t = calculate_delta_R(target["B11"], target["B12"], c, valid)
+    dR_r = calculate_delta_R(reference["B11"], reference["B12"], c, valid)
+
+    dOmega_t = dR_t / K_MBMP
+    dOmega_r = dR_r / K_MBMP
+    dOmega = dOmega_t - dOmega_r
+    dOmega[~valid] = np.nan
+
+    dOmega_detrended, _ = remove_large_scale_background(dOmega, valid, sigma=DETREND_SIGMA)
+    d_smooth = normalized_gaussian(dOmega_detrended, valid, GAUSS_SIGMA)
+
+    vals = d_smooth[np.isfinite(d_smooth)]
+    if vals.size == 0:
+        raise RuntimeError("No finite values after detrending. Try a different reference scene.")
+
+    median, sigma_robust = _robust_stats(vals)
+
+    threshold_sigma = median + max(
+        PARAMS["threshold_sigma"] * sigma_robust,
+        PARAMS["abs_floor_ppb"],
+    )
+    threshold_pct = float(np.percentile(vals, PARAMS["threshold_percentile_cap"]))
+    threshold = min(threshold_sigma, threshold_pct)
+    threshold = max(threshold, median + PARAMS["abs_floor_ppb"])
+
+    candidate = np.isfinite(d_smooth) & (d_smooth > threshold) & valid
+
+    spatial_mask, site_rc = make_spatial_mask(dOmega.shape, profile)
+    candidate &= spatial_mask
+
+    structure = np.ones((3, 3), dtype=np.uint8)
+    labeled, n_labels = label(candidate, structure=structure)
+    plume = np.zeros_like(candidate, dtype=bool)
+    if n_labels > 0:
+        sizes = np.bincount(labeled.ravel(), minlength=n_labels + 1)
+        sizes[0] = 0
+        sizes_kept = np.where(sizes >= PARAMS["min_component_pixels"], sizes, 0)
+        if sizes_kept.max() > 0:
+            order = np.argsort(sizes_kept)[::-1]
+            order = order[order != 0]
+            best_label = int(order[0])
+            best_size = int(sizes_kept[best_label])
+            if best_size < 30 and len(order) >= 2:
+                top_labels = order[:3]
+                plume = np.isin(labeled, top_labels)
+            else:
+                plume = (labeled == best_label)
+            area_km2 = plume.sum() * (RESOLUTION * RESOLUTION) / 1e6
+            if area_km2 > PARAMS["max_plume_area_km2"]:
+                plume[:] = False
+
+    if plume.any() and PARAMS["final_dilation"] > 0:
+        plume = binary_dilation(plume, structure=disk(int(PARAMS["final_dilation"])))
+    plume &= valid & spatial_mask
+
+    diagnostics = {
+        "median_ppb": float(median),
+        "sigma_ppb": float(sigma_robust),
+        "threshold_sigma_ppb": float(threshold_sigma),
+        "threshold_pct_ppb": float(threshold_pct),
+        "threshold_final_ppb": float(threshold),
+        "valid_pixels": int(vals.size),
+        "above_threshold": int((vals > threshold).sum()),
+    }
+
+    return {
+        "relative": dOmega,
+        "detrended": dOmega_detrended,
+        "gaussian": d_smooth,
+        "valid": valid,
+        "spatial_mask": spatial_mask,
+        "initial": candidate,
+        "final": plume,
+        "mean": median,
+        "std": sigma_robust,
+        "threshold": threshold,
+        "regions": int(1 if plume.any() else 0),
+        "valid_count": int(valid.sum()),
+        "initial_count": int(candidate.sum()),
+        "final_count": int(plume.sum()),
+        "c": float(c),
+        "site_rc": site_rc,
+        "diagnostics": diagnostics,
+    }
+
 
 def save_raster(path, array, profile, mask=False):
     output_profile = profile.copy()
@@ -1090,12 +810,70 @@ def georeferenced_png_package(array, profile, mask=False):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  STREAMLIT UI
+#  TIME-SERIES
 # ══════════════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="Sentinel-2 Methane — SimCLR", page_icon="🛰️", layout="wide", initial_sidebar_state="collapsed")
+def process_single_day(target_scene, reference_scenes, aoi, access_token, store_image=True):
+    try:
+        target_date = get_datetime(target_scene)
+        target_path = download_scene(target_scene, aoi, access_token)
+        target_bands, target_profile = read_stack(target_path)
+        target_tile = get_tile(target_scene)
+        same_tile = [r for r in reference_scenes if get_tile(r) == target_tile]
+        candidates = same_tile if same_tile else reference_scenes
+        best_ref_bands = None
+        best_corr = -np.inf
+        best_valid_count = 0
+        for ref in candidates:
+            try:
+                ref_bands, _ = read_stack(download_scene(ref, aoi, access_token))
+            except Exception:
+                continue
+            valid_px = np.isfinite(target_bands["B04"]) & np.isfinite(ref_bands["B04"])
+            valid_count = int(valid_px.sum())
+            if valid_count >= PARAMS["min_valid_ref_pixels"]:
+                t_vals = target_bands["B04"][valid_px]
+                r_vals = ref_bands["B04"][valid_px]
+                corr = np.nan
+                if np.std(t_vals) > 1e-9 and np.std(r_vals) > 1e-9:
+                    try:
+                        corr = float(np.corrcoef(t_vals, r_vals)[0, 1])
+                    except Exception:
+                        corr = np.nan
+                if np.isfinite(corr) and corr > best_corr:
+                    best_corr = corr
+                    best_ref_bands = ref_bands
+                    best_valid_count = valid_count
+                elif best_ref_bands is None and valid_count > best_valid_count:
+                    best_valid_count = valid_count
+                    best_ref_bands = ref_bands
+                    best_corr = np.nan
+        if best_ref_bands is None:
+            return None
+        result = run_algorithm(target_bands, best_ref_bands, target_profile)
+        row = {
+            "date": target_date,
+            "mean_mbmp": float(np.nanmean(result["detrended"])),
+            "max_mbmp": float(np.nanmax(result["detrended"])),
+            "std_mbmp": float(np.nanstd(result["detrended"])),
+            "final_pixels": int(result["final_count"]),
+            "regions": int(result["regions"]),
+            "b4_correlation": float(best_corr) if np.isfinite(best_corr) else np.nan,
+        }
+        if store_image:
+            row["png_relative"] = image_png(result["detrended"])
+            row["png_mask"] = image_png(result["final"], mask=True)
+        return row
+    except Exception as exc:
+        return {"date": get_datetime(target_scene), "error": str(exc)}
 
-# ── CSS (identical to original) ──
+
+# ══════════════════════════════════════════════════════════════════════════
+#  UI
+# ══════════════════════════════════════════════════════════════════════════
+
+st.set_page_config(page_title="Sentinel-2 Methane", page_icon="🛰️", layout="wide", initial_sidebar_state="collapsed")
+
 st.markdown("""
 <style>
 :root {
@@ -1168,17 +946,16 @@ footer { visibility: hidden; }
 st.markdown("""
 <div class="app-header">
     <div>
-        <div class="app-title">🛰️ Sentinel-2 Methane — SimCLR Framework</div>
-        <div class="app-subtitle">ISPRS 2026 · Self-Supervised Learning + IME Quantification · MobileNet/SwinT/Xception</div>
+        <div class="app-title">🛰️ Sentinel-2 Methane Screening</div>
+        <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC-faithful ΔΩ (ppb) candidate detection &nbsp;|&nbsp; v5 cloud-aware</div>
     </div>
-    <div class="status-pill">20 m processing &nbsp;&nbsp; Deep Learning</div>
+    <div class="status-pill">20 m processing &nbsp;&nbsp; Light dashboard</div>
 </div>
 """, unsafe_allow_html=True)
 
 if "aoi" not in st.session_state:
     st.session_state.aoi = mapping(DEFAULT_AOI)
 
-# ── Section 01: Study Area ──
 map_col, control_col = st.columns([1.65, 1.0], gap="small")
 with map_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
@@ -1287,14 +1064,12 @@ with map_col:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ── Section 02: Scene Search + Algorithm Selection ──
 with control_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">02 · SEARCH & ALGORITHM</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">02 · SEARCH</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-title">Scene Search</div>', unsafe_allow_html=True)
-
     default_end = datetime.now().date()
-    default_start = default_end - timedelta(days=90)
+    default_start = default_end - timedelta(days=30)
     d1, d2 = st.columns(2, gap="small")
     with d1:
         start_date = st.date_input("Start date", default_start, key="start_date")
@@ -1306,28 +1081,6 @@ with control_col:
     with s2:
         reference_days = st.slider("Reference window (days)", 1, 90, 60, key="reference_days")
 
-    # Algorithm selection
-    st.markdown('<div class="card-title" style="margin-top:0.5rem;">Algorithm</div>', unsafe_allow_html=True)
-    algorithm_mode = st.radio(
-        "Select algorithm",
-        ["SimCLR (SSL) + Fine-tuning", "MBMP Baseline (for labeling)"],
-        index=0,
-        key="algorithm_mode",
-        label_visibility="collapsed",
-    )
-
-    # Backbone selection for SimCLR
-    if "SimCLR" in algorithm_mode:
-        backbone_choice = st.selectbox(
-            "Encoder backbone",
-            ["mobilenet_v3_small", "inception_v3", "densenet121", "xception", "vit_base_patch16_224", "swin_tiny_patch4_window7_224"],
-            index=0,
-            key="backbone_choice",
-        )
-        simclr_epochs = st.number_input("SimCLR pretraining epochs", 5, 200, 30, key="simclr_epochs")
-        finetune_epochs = st.number_input("Fine-tuning epochs", 5, 100, 20, key="finetune_epochs")
-        warmup_epochs = st.number_input("Warmup (frozen encoder) epochs", 0, 30, 10, key="warmup_epochs")
-
     if st.button("🔍  Search Sentinel-2 scenes", type="primary", use_container_width=True):
         try:
             with st.spinner("Searching CDSE STAC..."):
@@ -1337,12 +1090,15 @@ with control_col:
                     datetime.combine(end_date, datetime.max.time()),
                     max_cloud,
                 )
+
             if search_results is None:
                 search_results = []
             elif not isinstance(search_results, list):
                 search_results = list(search_results)
+
             st.session_state["scene_results"] = search_results
             st.session_state.pop("target", None)
+
             if search_results:
                 st.success(f"{len(search_results)} scene(s) found")
             else:
@@ -1356,22 +1112,44 @@ with control_col:
 
     if scene_results:
         scene_table = pd.DataFrame([
-            {"date": get_datetime(scene), "tile": get_tile(scene), "cloud": get_cloud(scene)}
+            {
+                "date": get_datetime(scene),
+                "tile": get_tile(scene),
+                "cloud": get_cloud(scene),
+            }
             for scene in scene_results
-        ]).sort_values(["date", "cloud"], ascending=[True, True], na_position="last")
+        ]).sort_values(
+            ["date", "cloud"],
+            ascending=[True, True],
+            na_position="last",
+        )
 
         st.dataframe(
-            scene_table, use_container_width=True, height=112, hide_index=True,
+            scene_table,
+            use_container_width=True,
+            height=112,
+            hide_index=True,
             column_config={
                 "date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
                 "cloud": st.column_config.NumberColumn("Cloud %", format="%.1f"),
             },
         )
 
-        scene_ids = [as_dict(scene).get("id") for scene in scene_results if as_dict(scene).get("id")]
+        scene_ids = [
+            as_dict(scene).get("id")
+            for scene in scene_results
+            if as_dict(scene).get("id")
+        ]
 
         def format_scene(scene_id):
-            scene = next((c for c in scene_results if as_dict(c).get("id") == scene_id), None)
+            scene = next(
+                (
+                    candidate
+                    for candidate in scene_results
+                    if as_dict(candidate).get("id") == scene_id
+                ),
+                None,
+            )
             if scene is None:
                 return str(scene_id)
             scene_date = get_datetime(scene)
@@ -1379,53 +1157,45 @@ with control_col:
             return f"{date_text}  |  {get_tile(scene) or 'Unknown tile'}  |  cloud {get_cloud(scene):.1f}%"
 
         if scene_ids:
-            selected_scene_id = st.selectbox("Target scene", scene_ids, format_func=format_scene, key="target_scene_select")
-            selected_scene = next((s for s in scene_results if as_dict(s).get("id") == selected_scene_id), None)
+            selected_scene_id = st.selectbox(
+                "Target scene",
+                scene_ids,
+                format_func=format_scene,
+                key="target_scene_select",
+            )
+            selected_scene = next(
+                (
+                    scene
+                    for scene in scene_results
+                    if as_dict(scene).get("id") == selected_scene_id
+                ),
+                None,
+            )
             if selected_scene is not None:
                 st.session_state["target"] = selected_scene
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ── Section 03 & 04: Process ──
 st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
 settings_col, action_col = st.columns([1.65, 1.0], gap="small")
-
 with settings_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-label">03 · TRAINING DATA</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-title">Training Configuration</div>', unsafe_allow_html=True)
-
-    if "SimCLR" in algorithm_mode:
-        st.markdown(
-            '<div class="card-caption">'
-            'SimCLR pretraining uses unlabeled Sentinel-2 tiles downloaded from the search window. '
-            'Fine-tuning requires labeled plume masks. You can either draw plumes on the map '
-            '(using the polygon tool) or generate pseudo-labels automatically using the MBMP baseline.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-        label_source = st.radio(
-            "Label source for fine-tuning",
-            ["Auto (MBMP pseudo-labels)", "Manual (draw on map)"],
-            index=0,
-            key="label_source",
-        )
-    else:
-        st.markdown(
-            '<div class="card-caption">'
-            'MBMP baseline computes enhancement maps directly. No training required. '
-            'Use this mode for quick screening or to generate pseudo-labels.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-    num_training_scenes = st.slider("Number of training scenes to download", 5, 50, 20, key="num_training_scenes")
+    st.markdown('<div class="section-label">03 · DETECTION</div>', unsafe_allow_html=True)
+    p1, p2, p3 = st.columns(3, gap="small")
+    with p1:
+        PARAMS["threshold_sigma"] = st.number_input("Threshold multiplier", min_value=0.1, max_value=6.0, value=float(PARAMS["threshold_sigma"]), step=0.1, key="threshold_sigma")
+    with p2:
+        PARAMS["min_component_pixels"] = st.number_input("Minimum candidate pixels", min_value=2, max_value=1000, value=int(PARAMS["min_component_pixels"]), step=5, key="min_component_pixels")
+    with p3:
+        PARAMS["final_dilation"] = st.number_input("Final dilation radius", min_value=0, max_value=20, value=int(PARAMS["final_dilation"]), step=1, key="final_dilation")
+    estimated_area_m2 = int(PARAMS["min_component_pixels"]) * RESOLUTION * RESOLUTION
+    st.markdown(f'<div class="card-caption">Minimum connected region ≈ {estimated_area_m2:,} m² at {RESOLUTION} m resolution.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with action_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">04 · PROCESS</div>', unsafe_allow_html=True)
-
+    scene_results = st.session_state.get("scene_results", [])
     cdse_auth = st.session_state.get("cdse_auth")
     if cdse_auth:
         st.markdown(f'<div class="auth-status">✓ Copernicus connected · {cdse_auth.get("username", "")}</div>', unsafe_allow_html=True)
@@ -1437,7 +1207,7 @@ with action_col:
     else:
         st.markdown('<div class="auth-card">', unsafe_allow_html=True)
         st.markdown('<div class="card-title">Copernicus login</div>', unsafe_allow_html=True)
-        st.markdown('<div class="auth-help">Log in once. Password is sent directly to Copernicus.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="auth-help">Log in once in this browser session. Your password is sent directly to the official Copernicus identity service; the app keeps only the temporary API token.</div>', unsafe_allow_html=True)
         st.link_button("🌐 Open Copernicus website", "https://dataspace.copernicus.eu/", use_container_width=True)
         with st.form("cdse_login_form", clear_on_submit=True):
             login_user = st.text_input("Copernicus email", placeholder="your-email@example.com")
@@ -1448,7 +1218,7 @@ with action_col:
             try:
                 with st.spinner("Connecting to Copernicus…"):
                     st.session_state.cdse_auth = authenticate_cdse(login_user, login_password, login_totp)
-                st.success("Copernicus login successful.")
+                st.success("Copernicus login successful. You can now run the detection.")
                 st.rerun()
             except Exception as login_error:
                 st.error(str(login_error))
@@ -1461,271 +1231,204 @@ with action_col:
             target_tile = get_tile(target) or "Unknown tile"
             target_label = target_date.strftime("%Y-%m-%d") if target_date else "Unknown date"
             st.markdown(f'<div class="card-title">Ready to detect</div><div class="card-caption">Target: {target_label} · {target_tile}</div>', unsafe_allow_html=True)
-
-            run_button_label = "🧠  Train SimCLR & Detect Methane" if "SimCLR" in algorithm_mode else "📊  Run MBMP Baseline"
-            detect_clicked = st.button(
-                run_button_label, type="primary", use_container_width=True,
-                key="detect_button", disabled=not bool(st.session_state.get("cdse_auth"))
-            )
+            detect_clicked = st.button("🛰️  Download AOI & Detect Methane", type="primary", use_container_width=True, key="detect_button", disabled=not bool(st.session_state.get("cdse_auth")))
             if not st.session_state.get("cdse_auth"):
-                st.markdown('<div class="card-caption">Please connect your Copernicus account first.</div>', unsafe_allow_html=True)
-
+                st.markdown('<div class="card-caption">Please connect your Copernicus account above before downloading Sentinel-2 data.</div>', unsafe_allow_html=True)
             if detect_clicked:
-                progress = st.progress(0, text="Preparing…")
+                progress = st.progress(0, text="Preparing methane detection…")
                 progress_status = st.empty()
                 try:
+                    progress_status.markdown('<div class="card-caption">Step 1 of 5 · Connecting to CDSE and preparing the target scene…</div>', unsafe_allow_html=True)
+                    progress.progress(8, text="Preparing target scene…")
                     access_token = get_access_token()
                     target = st.session_state["target"]
                     target_date = get_datetime(target)
                     target_tile = get_tile(target)
                     if target_date is None:
-                        raise RuntimeError("Target scene has no valid acquisition date.")
-
-                    # ── Download target scene ──
-                    progress_status.markdown('<div class="card-caption">Step 1 · Downloading target scene…</div>', unsafe_allow_html=True)
-                    progress.progress(5, text="Downloading target bands…")
-                    target_bands, profile = download_scene(target, st.session_state.aoi, access_token, return_array=True)
-
-                    # ── Select reference scenes ──
+                        raise RuntimeError("The selected target scene has no valid acquisition date.")
                     all_candidates = [
                         scene for scene in scene_results
                         if as_dict(scene).get("id") != as_dict(target).get("id")
                         and get_datetime(scene) is not None
                         and abs((get_datetime(scene) - target_date).total_seconds()) / 86400 <= reference_days
                     ]
-                    same_tile = [s for s in all_candidates if get_tile(s) == target_tile]
+                    same_tile = [scene for scene in all_candidates if get_tile(scene) == target_tile]
                     references = same_tile if same_tile else all_candidates
+                    if not references:
+                        st.warning("No reference scene exists in the selected time window. Increase the date range or reference window.")
+                        st.stop()
+                    progress_status.markdown('<div class="card-caption">Step 2 of 5 · Downloading target image bands and preparing the AOI…</div>', unsafe_allow_html=True)
+                    progress.progress(25, text="Downloading target bands…")
+                    target_bands, profile = read_stack(download_scene(target, st.session_state.aoi, access_token))
 
-                    if "MBMP" in algorithm_mode:
-                        # ── MBMP Baseline ──
-                        if not references:
-                            raise RuntimeError("No reference scene available for MBMP.")
-                        progress_status.markdown('<div class="card-caption">Step 2 · Computing MBMP enhancement…</div>', unsafe_allow_html=True)
-                        progress.progress(30, text="Downloading reference scene…")
-                        ref_bands, _ = download_scene(references[0], st.session_state.aoi, access_token, return_array=True)
-                        enhancement = mbmp_enhancement(target_bands, ref_bands)
-                        # Threshold at 2-sigma
-                        valid_vals = enhancement[np.isfinite(enhancement)]
-                        med = np.median(valid_vals)
-                        sigma = np.std(valid_vals)
-                        plume_mask = enhancement > (med + 2.0 * sigma)
-                        result = {
-                            "enhancement": enhancement,
-                            "final": plume_mask,
-                            "mean": med,
-                            "std": sigma,
-                            "threshold": med + 2.0 * sigma,
-                            "valid_count": int(np.isfinite(enhancement).sum()),
-                            "final_count": int(plume_mask.sum()),
-                            "regions": 1 if plume_mask.any() else 0,
-                            "initial_count": int((enhancement > med).sum()),
-                            "c": 0.0,
-                            "b4_correlation": float("nan"),
-                            "date": target_date.strftime("%Y-%m-%d"),
-                            "algorithm": "MBMP",
-                        }
-                        progress.progress(100, text="MBMP baseline complete")
-                        st.success("MBMP baseline computed.")
-                    else:
-                        # ── SimCLR Pipeline ──
-                        if not TORCH_AVAILABLE:
-                            raise RuntimeError("PyTorch is required for SimCLR. Please install torch, torchvision, timm.")
+                    best_reference = None
+                    best_correlation = -np.inf
+                    best_valid_count = 0
+                    reference_rows = []
+                    total_refs = max(1, len(references))
 
-                        # 1. Download unlabeled training tiles
-                        progress_status.markdown('<div class="card-caption">Step 2 · Downloading unlabeled training tiles…</div>', unsafe_allow_html=True)
-                        train_scenes = scene_results[:min(num_training_scenes, len(scene_results))]
-                        tiles = prepare_tiles_from_scenes(train_scenes, st.session_state.aoi, access_token, progress_bar=progress)
-                        if len(tiles) < 5:
-                            raise RuntimeError(f"Only {len(tiles)} tiles downloaded. Need at least 5. Try expanding the date range or cloud threshold.")
+                    for ref_index, reference in enumerate(references, start=1):
+                        pct = 30 + int(40 * (ref_index - 1) / total_refs)
+                        progress_status.markdown(f'<div class="card-caption">Step 3 of 5 · Downloading and comparing reference scene {ref_index} of {total_refs}…</div>', unsafe_allow_html=True)
+                        progress.progress(pct, text=f"Reference scene {ref_index} of {total_refs}…")
 
-                        # 2. SimCLR Pretraining
-                        progress_status.markdown('<div class="card-caption">Step 3 · SimCLR self-supervised pretraining…</div>', unsafe_allow_html=True)
-                        progress.progress(30, text="Pretraining SimCLR…")
-                        simclr_model, losses = pretrain_simclr(
-                            tiles, backbone_choice, epochs=int(simclr_epochs),
-                            batch_size=SIMCLR_BATCH_SIZE, lr=SIMCLR_LR, device="cpu"
-                        )
+                        try:
+                            reference_bands, _ = read_stack(download_scene(reference, st.session_state.aoi, access_token))
+                        except Exception:
+                            reference_rows.append({
+                                "id": as_dict(reference).get("id"),
+                                "date": get_datetime(reference),
+                                "tile": get_tile(reference),
+                                "b4_correlation": np.nan,
+                                "valid_b4_pixels": 0,
+                                "status": "download failed",
+                            })
+                            continue
 
-                        # 3. Prepare labeled data (fine-tuning)
-                        progress_status.markdown('<div class="card-caption">Step 4 · Preparing labeled data for fine-tuning…</div>', unsafe_allow_html=True)
-                        progress.progress(60, text="Generating labels…")
+                        valid_pixels = np.isfinite(target_bands["B04"]) & np.isfinite(reference_bands["B04"])
+                        valid_count = int(valid_pixels.sum())
 
-                        if label_source == "Auto (MBMP pseudo-labels)":
-                            # Generate pseudo-labels using MBMP
-                            labels = []
-                            label_tiles = []
-                            for i, scene in enumerate(train_scenes[:min(10, len(train_scenes))]):
+                        correlation = np.nan
+                        if valid_count >= PARAMS["min_valid_ref_pixels"]:
+                            t_vals = target_bands["B04"][valid_pixels]
+                            r_vals = reference_bands["B04"][valid_pixels]
+                            if np.std(t_vals) > 1e-9 and np.std(r_vals) > 1e-9:
                                 try:
-                                    bands, _ = download_scene(scene, st.session_state.aoi, access_token, return_array=True)
-                                    # Find reference
-                                    refs = [r for r in references if as_dict(r).get("id") != as_dict(scene).get("id")]
-                                    if not refs:
-                                        continue
-                                    ref_bands, _ = download_scene(refs[0], st.session_state.aoi, access_token, return_array=True)
-                                    enh = mbmp_enhancement(bands, ref_bands)
-                                    # Threshold
-                                    valid = enh[np.isfinite(enh)]
-                                    if len(valid) < 100:
-                                        continue
-                                    med = np.median(valid)
-                                    sig = np.std(valid)
-                                    mask = (enh > (med + 2.0 * sig)).astype(np.float32)
-                                    # Resize to 256x256
-                                    mask_t = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).float()
-                                    mask_t = F.interpolate(mask_t, size=(TILE_SIZE, TILE_SIZE), mode='nearest')
-                                    mask = mask_t.squeeze().numpy()
-                                    stacked = np.stack([bands[b] for b in BANDS], axis=0)
-                                    stacked[:5] = np.clip(stacked[:5], 0, 1)
-                                    stacked[5] = np.clip(stacked[5], 0, 11)
-                                    H, W = stacked.shape[1], stacked.shape[2]
-                                    if H > TILE_SIZE or W > TILE_SIZE:
-                                        top = (H - TILE_SIZE) // 2
-                                        left = (W - TILE_SIZE) // 2
-                                        stacked = stacked[:, top:top+TILE_SIZE, left:left+TILE_SIZE]
-                                    elif H < TILE_SIZE or W < TILE_SIZE:
-                                        pad_h = max(0, TILE_SIZE - H)
-                                        pad_w = max(0, TILE_SIZE - W)
-                                        stacked = np.pad(stacked, ((0,0),(0,pad_h),(0,pad_w)), mode='reflect')
-                                        mask = np.pad(mask, ((0,pad_h),(0,pad_w)), mode='constant')
-                                    label_tiles.append(stacked)
-                                    labels.append(mask)
-                                except Exception as e:
-                                    continue
-                            if len(labels) < 3:
-                                raise RuntimeError("Could not generate enough labeled samples. Try expanding the search.")
-                            labels_arr = np.array(labels)
-                            label_tiles_arr = np.array(label_tiles)
-                        else:
-                            # Manual labeling: use target scene + draw
-                            st.warning("Manual labeling mode: using MBMP pseudo-labels for demonstration. "
-                                       "In production, draw plume polygons on the map.")
-                            # Fallback to pseudo-labels
-                            labels_arr = np.zeros((1, TILE_SIZE, TILE_SIZE), dtype=np.float32)
-                            label_tiles_arr = tiles[:1]
+                                    correlation = float(np.corrcoef(t_vals, r_vals)[0, 1])
+                                except Exception:
+                                    correlation = np.nan
 
-                        # 4. Fine-tune
-                        progress_status.markdown('<div class="card-caption">Step 5 · Fine-tuning segmentation model…</div>', unsafe_allow_html=True)
-                        progress.progress(75, text="Fine-tuning…")
-                        # Get feat_dim from pretrained encoder
-                        feat_dim = simclr_model.feat_dim
-                        encoder = simclr_model.encoder
-                        seg_model = fine_tune_segmentation(
-                            encoder, label_tiles_arr, labels_arr, feat_dim,
-                            epochs=int(finetune_epochs), warmup_epochs=int(warmup_epochs),
-                            batch_size=8, lr=FINETUNE_LR, device="cpu"
+                        reference_rows.append({
+                            "id": as_dict(reference).get("id"),
+                            "date": get_datetime(reference),
+                            "tile": get_tile(reference),
+                            "b4_correlation": correlation,
+                            "valid_b4_pixels": valid_count,
+                            "status": "ok" if np.isfinite(correlation) else "low-validity",
+                        })
+
+                        if np.isfinite(correlation) and correlation > best_correlation:
+                            best_correlation = correlation
+                            best_reference = reference_bands
+                            best_valid_count = valid_count
+                        elif best_reference is None and valid_count > best_valid_count:
+                            best_valid_count = valid_count
+                            best_reference = reference_bands
+                            best_correlation = np.nan
+
+                    st.session_state.reference_table = pd.DataFrame(reference_rows)
+
+                    if best_reference is None:
+                        total_valid = sum(int(r.get("valid_b4_pixels", 0)) for r in reference_rows)
+                        target_valid = int(np.isfinite(target_bands["B04"]).sum())
+                        st.error(
+                            f"Could not select a reference scene.\n\n"
+                            f"- References downloaded: **{len(reference_rows)}**\n"
+                            f"- Total valid B4 pixels across all references: **{total_valid:,}**\n"
+                            f"- Target valid B4 pixels: **{target_valid:,}**\n\n"
+                            f"**Suggestions:**\n"
+                            f"1. Increase the **date range** (make start date earlier).\n"
+                            f"2. Increase the **cloud cover** threshold to 50–70%.\n"
+                            f"3. Increase **Reference window (days)** to 90.\n"
+                            f"4. Enlarge the AOI on the map (at least ~30×30 km)."
                         )
+                        st.stop()
 
-                        # 5. Predict on target scene
-                        progress_status.markdown('<div class="card-caption">Step 6 · Running detection on target scene…</div>', unsafe_allow_html=True)
-                        progress.progress(90, text="Detecting plumes…")
-                        plume_mask = predict_plume_mask(seg_model, target_bands, device="cpu", threshold=0.5)
+                    progress_status.markdown('<div class="card-caption">Step 4 of 5 · Running MBMC ΔΩ (ppb) anomaly detection and candidate cleanup…</div>', unsafe_allow_html=True)
+                    progress.progress(78, text="Running methane detection…")
+                    result = run_algorithm(target_bands, best_reference, profile)
+                    result["b4_correlation"] = best_correlation if np.isfinite(best_correlation) else float("nan")
+                    result["date"] = target_date.strftime("%Y-%m-%d")
 
-                        # Compute enhancement for visualization (MBMP)
-                        if references:
-                            ref_bands, _ = download_scene(references[0], st.session_state.aoi, access_token, return_array=True)
-                            enhancement = mbmp_enhancement(target_bands, ref_bands)
-                        else:
-                            enhancement = np.full_like(target_bands["B11"], np.nan)
+                    signal_ratio = result["final_count"] / max(1, result["valid_count"])
+                    result["signal_ratio"] = float(signal_ratio)
 
-                        valid_vals = enhancement[np.isfinite(enhancement)]
-                        result = {
-                            "enhancement": enhancement,
-                            "final": plume_mask,
-                            "mean": float(np.nanmedian(valid_vals)) if len(valid_vals) > 0 else 0.0,
-                            "std": float(np.nanstd(valid_vals)) if len(valid_vals) > 0 else 1.0,
-                            "threshold": 0.0,
-                            "valid_count": int(np.isfinite(enhancement).sum()),
-                            "final_count": int(plume_mask.sum()),
-                            "regions": 1 if plume_mask.any() else 0,
-                            "initial_count": int(plume_mask.sum()),
-                            "c": 0.0,
-                            "b4_correlation": float("nan"),
-                            "date": target_date.strftime("%Y-%m-%d"),
-                            "algorithm": f"SimCLR ({backbone_choice})",
-                            "simclr_losses": losses,
-                        }
-                        progress.progress(100, text="SimCLR detection complete")
-                        st.success("SimCLR detection completed successfully.")
-
-                    # ── IME Quantification ──
-                    progress_status.markdown('<div class="card-caption">Step 7 · Estimating emission rate (IME)…</div>', unsafe_allow_html=True)
-                    # Use a default wind speed (can be replaced with real data)
-                    wind_10m = st.number_input("10 m wind speed (m/s)", 0.0, 20.0, 3.0, key="wind_speed")
-                    Q_kg_h, ime, L = compute_emission_rate(result["final"], result["enhancement"], wind_10m)
-                    result["Q_kg_h"] = Q_kg_h
-                    result["IME_kg"] = ime
-                    result["plume_L_m"] = L
-                    result["wind_speed"] = wind_10m
-
-                    # Save results
                     output_folder = RESULT_DIR / target_date.strftime("%Y%m%d")
                     output_folder.mkdir(parents=True, exist_ok=True)
                     paths = {}
-                    for key in ("enhancement", "final"):
+                    for key in ("relative", "detrended", "gaussian", "final", "valid"):
                         paths[key] = output_folder / f"{key}.tif"
-                        save_raster(paths[key], result[key], profile, key == "final")
-
+                        save_raster(paths[key], result[key], profile, key in ("final", "valid"))
                     st.session_state.result = result
                     st.session_state.paths = paths
                     st.session_state.output_profile = profile
                     st.session_state.png_outputs = {
-                        "enhancement": image_png(result["enhancement"]),
+                        "relative": image_png(result["relative"]),
+                        "detrended": image_png(result["detrended"]),
+                        "gaussian": image_png(result["gaussian"]),
                         "final": image_png(result["final"], mask=True),
+                        "valid": image_png(result["valid"], mask=True),
                     }
-                    progress.progress(100, text="Complete")
-                    st.success("Processing completed successfully.")
+                    progress_status.markdown('<div class="card-caption">Step 5 of 5 · Saving georeferenced outputs and preparing downloads…</div>', unsafe_allow_html=True)
+                    progress.progress(100, text="Ready to detect · outputs are ready")
+                    st.success("Processing completed")
 
                     if result["final_count"] == 0:
-                        st.warning("No plume pixels detected above threshold. Try adjusting the threshold or using a different scene.")
-
+                        st.warning(
+                            f"⚠️ **No plume above threshold detected.** "
+                            f"Median ΔΩ = {result['mean']:.2f} ppb, robust σ = {result['std']:.2f} ppb, "
+                            f"threshold = {result['threshold']:.2f} ppb. "
+                            f"Try lowering the Threshold multiplier to 1.5–2.0, or pick a different "
+                            f"target/reference date pair."
+                        )
+                    elif signal_ratio < 0.00005:
+                        st.warning(
+                            f"⚠️ **Very small final mask.** "
+                            f"The candidate mask covers only **{signal_ratio*100:.5f}%** of valid pixels "
+                            f"({result['final_count']:,} / {result['valid_count']:,}). "
+                            f"This may be a weak plume or residual noise."
+                        )
                 except Exception as error:
-                    st.error(f"Processing failed: {error}")
-                    import traceback
-                    st.code(traceback.format_exc())
+                    st.error(f"Detection failed: {error}")
     else:
-        st.markdown('<div class="card-title">Select scenes first</div><div class="card-caption">Search for Sentinel-2 scenes and select a target.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card-title">Select scenes first</div><div class="card-caption">Search for Sentinel-2 scenes, select a target, then run the detection.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════
-#  RESULTS DISPLAY
+#  RESULTS
 # ══════════════════════════════════════════════════════════════════════════
 
 if "result" in st.session_state:
     result = st.session_state.result
     png_outputs = st.session_state.get("png_outputs", {})
     profile = st.session_state.get("output_profile")
-
     st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
-
-    # Metrics row
     metrics = st.columns(6, gap="small")
-    metrics[0].metric("Algorithm", result.get("algorithm", "N/A"))
+    corr_text = f"{result['b4_correlation']:.3f}" if np.isfinite(result.get("b4_correlation", np.nan)) else "n/a"
+    metrics[0].metric("B4 correlation", corr_text)
     metrics[1].metric("Valid pixels", f"{result['valid_count']:,}")
-    metrics[2].metric("Plume pixels", f"{result['final_count']:,}")
-    metrics[3].metric("Regions", result["regions"])
-    if "Q_kg_h" in result:
-        metrics[4].metric("Emission rate", f"{result['Q_kg_h']:.0f} kg/h")
-        metrics[5].metric("IME", f"{result['IME_kg']:.2f} kg")
-    else:
-        metrics[4].metric("Threshold", f"{result['threshold']:.2f}")
-        metrics[5].metric("Median", f"{result['mean']:.2f}")
+    metrics[2].metric("Initial", f"{result['initial_count']:,}")
+    metrics[3].metric("Final", f"{result['final_count']:,}")
+    metrics[4].metric("Regions", result["regions"])
+    metrics[5].metric("Threshold", f"{result['threshold']:.2f}")
 
-    # SimCLR loss curve
-    if "simclr_losses" in result:
-        with st.expander("📉 SimCLR pretraining loss", expanded=False):
-            loss_df = pd.DataFrame({"Epoch": range(1, len(result["simclr_losses"]) + 1), "Loss": result["simclr_losses"]})
-            st.line_chart(loss_df.set_index("Epoch"), use_container_width=True, height=200)
+    diag = result.get("diagnostics", {})
+    if diag:
+        with st.expander("🔍 Threshold & noise diagnostics", expanded=False):
+            dcols = st.columns(4, gap="small")
+            dcols[0].metric("Median (ppb)", f"{diag['median_ppb']:.2f}")
+            dcols[1].metric("Robust σ (ppb)", f"{diag['sigma_ppb']:.2f}")
+            dcols[2].metric("σ-threshold (ppb)", f"{diag['threshold_sigma_ppb']:.2f}")
+            dcols[3].metric("Final threshold (ppb)", f"{diag['threshold_final_ppb']:.2f}")
+            st.caption(
+                f"Valid pixels: **{diag['valid_pixels']:,}** · "
+                f"Above threshold: **{diag['above_threshold']:,}** · "
+                f"Percentile cap (p{PARAMS['threshold_percentile_cap']:.0f}): **{diag['threshold_pct_ppb']:.2f} ppb**. "
+                f"The final threshold is the **minimum** of the σ-based value and the percentile cap."
+            )
 
-    # Result images
     result_items = [
-        ("enhancement", "CH4 Enhancement (ppb)", "Enhancement"),
-        ("final", "Detected Plume Mask", "Plume Mask"),
+        ("detrended", "ΔΩ after detrend (ppb)", "Detrended"),
+        ("gaussian", "Gaussian smoothed", "Smoothed"),
+        ("final", "Methane candidates", "Final mask"),
+        ("valid", "Valid pixels", "Validity mask"),
     ]
-    result_cols = st.columns(2, gap="small")
+    result_cols = st.columns(4, gap="small")
     for col, (key, title, tag) in zip(result_cols, result_items):
         with col:
+            st.markdown('<div class="result-card">', unsafe_allow_html=True)
             st.markdown(f'<div class="result-tag">{tag}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="result-name">{title}</div>', unsafe_allow_html=True)
             preview_col, legend_col = st.columns([3.6, 1.0], gap="small")
@@ -1733,40 +1436,156 @@ if "result" in st.session_state:
                 st.image(png_outputs[key], use_container_width=True, output_format="PNG")
             with legend_col:
                 st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
-                legend_kind = "mask" if key == "final" else "continuous"
+                if key == "final":
+                    legend_kind = "mask"
+                elif key == "valid":
+                    legend_kind = "valid"
+                else:
+                    legend_kind = "continuous"
                 st.markdown(legend_html(legend_kind), unsafe_allow_html=True)
             path = st.session_state.paths[key]
             format_choice = st.selectbox("Download format", ["GeoTIFF (georeferenced)", "PNG + World File (georeferenced)"], key=f"format_choice_{key}")
             if format_choice == "GeoTIFF (georeferenced)":
-                st.download_button("⬇ Download GeoTIFF", path.read_bytes(), file_name=path.name, mime="image/tiff", key=f"download_tif_{key}", use_container_width=True)
+                st.download_button("⬇ Download GeoTIFF", path.read_bytes(), file_name=path.name, mime="image/tiff", key=f"download_tif_compact_{key}", use_container_width=True)
             else:
-                png_package = georeferenced_png_package(result[key], profile, mask=key == "final")
-                st.download_button("⬇ Download Georeferenced PNG package", png_package, file_name=f"{key}_georeferenced_png.zip", mime="application/zip", key=f"download_png_{key}", use_container_width=True)
+                png_package = georeferenced_png_package(result[key], profile, mask=key in ("final", "valid"))
+                st.download_button("⬇ Download Georeferenced PNG package", png_package, file_name=f"{key}_georeferenced_png.zip", mime="application/zip", key=f"download_png_compact_{key}", use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
 
-    # Summary note
-    if "Q_kg_h" in result:
-        st.markdown(
-            f'<div class="result-note">'
-            f'<b>Emission quantification (IME):</b> '
-            f'Q = <b>{result["Q_kg_h"]:.0f} kg/h</b> · '
-            f'IME = <b>{result["IME_kg"]:.2f} kg</b> · '
-            f'Plume characteristic length L = <b>{result["plume_L_m"]:.0f} m</b> · '
-            f'Wind speed (10 m) = <b>{result["wind_speed"]:.1f} m/s</b>. '
-            f'U<sub>eff</sub> = 0.34·U<sub>10</sub> + 0.44.'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+    st.markdown(f'<div class="result-note"><b>Robust thresholding v5:</b> median = <b>{result["mean"]:.2f} ppb</b>, robust σ = <b>{result["std"]:.2f} ppb</b>, threshold = <b>{result["threshold"]:.2f} ppb</b>. SCL cloud/shadow masking active. Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · c = <b>{result["c"]:.4f}</b> · detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
+    d1, d2 = st.columns([1, 3], gap="small")
+    with d1:
+        st.download_button("⬇ Reference table CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection.csv", mime="text/csv", key="download_reference_csv_compact", use_container_width=True)
+    with d2:
+        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">ΔΩ (ppb) is a screening quantity following the MBMC framework (Cheng et al., 2026); it is not physical methane concentration or an emission rate.</div>', unsafe_allow_html=True)
 
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">05a · 30-DAY TIME SERIES & VISUAL PLAYBACK</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">Track daily changes of detrended ΔΩ (ppb) over the 30-day window. Use the slider below the chart to visually scrub through each day.</div>', unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════════
-#  S5P CONTEXT (kept from original)
-# ══════════════════════════════════════════════════════════════════════════
+    ts_col1, ts_col2 = st.columns([1, 3], gap="small")
+    with ts_col1:
+        run_ts = st.button("📈  Build 30-day series + visuals", type="primary", use_container_width=True, key="build_ts_button", disabled=not bool(st.session_state.get("cdse_auth")))
+    with ts_col2:
+        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">Downloads and processes every Sentinel-2 scene in the window. Cached after first run.</div>', unsafe_allow_html=True)
 
-if "result" in st.session_state:
+    if run_ts:
+        try:
+            access_token = get_access_token()
+            target_date = get_datetime(st.session_state.get("target"))
+            if target_date is None:
+                raise RuntimeError("Target date is missing.")
+            window_scenes = [
+                s for s in st.session_state.get("scene_results", [])
+                if get_datetime(s) is not None
+                and abs((get_datetime(s) - target_date).total_seconds()) / 86400 <= 30
+            ]
+            by_day = {}
+            for s in window_scenes:
+                d = get_datetime(s).date()
+                by_day.setdefault(d, []).append(s)
+            days_sorted = sorted(by_day.keys())
+
+            ts_progress = st.progress(0, text="Building time series…")
+            ts_status = st.empty()
+            rows = []
+            daily_visuals = {}
+            total_days = max(1, len(days_sorted))
+            for idx, day in enumerate(days_sorted, start=1):
+                ts_status.markdown(f'<div class="card-caption">Processing day {idx} of {total_days} · {day.isoformat()}</div>', unsafe_allow_html=True)
+                ts_progress.progress(int(100 * idx / total_days), text=f"Day {idx} of {total_days}")
+                day_scenes = sorted(by_day[day], key=lambda s: get_cloud(s))
+                target_scene_day = day_scenes[0]
+                refs = [
+                    s for s in window_scenes
+                    if as_dict(s).get("id") != as_dict(target_scene_day).get("id")
+                    and get_datetime(s) is not None
+                    and abs((get_datetime(s) - get_datetime(target_scene_day)).total_seconds()) / 86400 <= 15
+                ]
+                if not refs:
+                    continue
+                row = process_single_day(target_scene_day, refs, st.session_state.aoi, access_token, store_image=True)
+                if row is not None and "error" not in row:
+                    rows.append({k: v for k, v in row.items() if not k.startswith("png_")})
+                    daily_visuals[row["date"].strftime("%Y-%m-%d")] = {
+                        "png_relative": row["png_relative"],
+                        "png_mask": row["png_mask"],
+                        "mean_mbmp": row["mean_mbmp"],
+                        "max_mbmp": row["max_mbmp"],
+                        "final_pixels": row["final_pixels"],
+                    }
+
+            if rows:
+                ts_df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+                st.session_state.timeseries_df = ts_df
+                st.session_state.daily_visuals = daily_visuals
+                ts_progress.progress(100, text="Time series ready")
+                ts_status.empty()
+                st.success(f"Time series built · {len(ts_df)} day(s) processed · {len(daily_visuals)} visual frames")
+            else:
+                st.warning("No valid day could be processed. Try a wider date range or a larger AOI.")
+        except Exception as ts_error:
+            st.error(f"Time series failed: {ts_error}")
+
+    if "timeseries_df" in st.session_state:
+        ts = st.session_state.timeseries_df
+        if not ts.empty and "mean_mbmp" in ts.columns:
+            chart_df = ts.dropna(subset=["mean_mbmp"]).set_index("date")[["mean_mbmp", "max_mbmp"]]
+            if not chart_df.empty:
+                st.markdown('<div class="card-caption">Daily detrended ΔΩ (ppb) statistics in the AOI</div>', unsafe_allow_html=True)
+                st.line_chart(chart_df, use_container_width=True, height=240)
+                st.dataframe(
+                    ts,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=180,
+                    column_config={
+                        "date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
+                        "mean_mbmp": st.column_config.NumberColumn("Mean ΔΩ (ppb)", format="%.2f"),
+                        "max_mbmp": st.column_config.NumberColumn("Max ΔΩ (ppb)", format="%.2f"),
+                        "std_mbmp": st.column_config.NumberColumn("Std ΔΩ (ppb)", format="%.2f"),
+                        "b4_correlation": st.column_config.NumberColumn("B4 corr", format="%.3f"),
+                    },
+                )
+                st.download_button(
+                    "⬇ Download 30-day series CSV",
+                    ts.to_csv(index=False),
+                    file_name="s2_timeseries_30d.csv",
+                    mime="text/csv",
+                    key="download_ts_csv",
+                    use_container_width=False,
+                )
+
+    if "daily_visuals" in st.session_state:
+        visuals = st.session_state.daily_visuals
+        dates_available = sorted(visuals.keys())
+        if dates_available:
+            st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
+            st.markdown('<div class="card-caption" style="font-weight:700;font-size:0.85rem;">🎬 Visual daily playback — drag the slider to scrub through the month</div>', unsafe_allow_html=True)
+            selected_day = st.select_slider(
+                "Select day",
+                options=dates_available,
+                value=dates_available[0],
+                key="visual_day_slider",
+                label_visibility="collapsed",
+            )
+            if selected_day in visuals:
+                frame = visuals[selected_day]
+                v1, v2 = st.columns(2, gap="small")
+                with v1:
+                    st.markdown(f'<div class="card-caption" style="font-weight:700;">{selected_day} · ΔΩ detrended</div>', unsafe_allow_html=True)
+                    st.image(frame["png_relative"], use_container_width=True, output_format="PNG")
+                with v2:
+                    st.markdown(f'<div class="card-caption" style="font-weight:700;">{selected_day} · Candidate mask</div>', unsafe_allow_html=True)
+                    st.image(frame["png_mask"], use_container_width=True, output_format="PNG")
+                m1, m2, m3 = st.columns(3, gap="small")
+                m1.metric("Mean ΔΩ (ppb)", f"{frame['mean_mbmp']:.2f}")
+                m2.metric("Max ΔΩ (ppb)", f"{frame['max_mbmp']:.2f}")
+                m3.metric("Candidate pixels", f"{frame['final_pixels']:,}")
+
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). Visualization is anomaly relative to local mean.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). All pixels are shown (no QA filtering). Visualization is <b>anomaly relative to the local mean</b>.</div>', unsafe_allow_html=True)
 
     s5p_col1, s5p_col2 = st.columns([1, 3], gap="small")
     with s5p_col1:
@@ -1799,11 +1618,17 @@ if "result" in st.session_state:
     if "s5p_ch4" in st.session_state:
         ch4 = st.session_state.s5p_ch4
         valid_ch4 = ch4[np.isfinite(ch4)]
+
         if valid_ch4.size < 2:
             placeholder = float(np.nanmean(valid_ch4)) if valid_ch4.size > 0 else 1900.0
             ch4 = np.full_like(ch4, placeholder)
             valid_ch4 = ch4[np.isfinite(ch4)]
-            st.warning("⚠️ Sentinel-5P returned no valid pixels. Showing placeholder.")
+            st.warning(
+                "⚠️ Sentinel-5P returned no valid pixels for this AOI and time window "
+                "(cloud cover / QA). Showing the AOI center with a placeholder value. "
+                "Try increasing the temporal window to 30 days."
+            )
+
         if valid_ch4.size > 1:
             mean_val = float(np.nanmean(valid_ch4))
             max_val = float(np.nanmax(valid_ch4))
@@ -1819,17 +1644,8 @@ if "result" in st.session_state:
             with leg_col:
                 st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
                 st.markdown(legend_html("s5p"), unsafe_allow_html=True)
-            st.markdown('<div class="card-caption">Each pixel is deviation from local mean (red = above, blue = below).</div>', unsafe_allow_html=True)
+            st.markdown('<div class="card-caption">Each pixel is shown as deviation from the local mean (red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill may only occupy 1–2 pixels.</div>', unsafe_allow_html=True)
+        else:
+            st.warning("Not enough valid S5P CH4 pixels even after fallback. Increase the temporal window to 30 days.")
 
     st.markdown('</div>', unsafe_allow_html=True)
-
-# ── Footer note ──
-st.markdown('<div style="height:0.5rem"></div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="card-caption" style="text-align:center;opacity:0.6;">'
-    'SimCLR framework adapted from ISPRS Archives XLIX-B1-2026-397-2026 · '
-    'MBMP reference: Varon et al. (2021) · IME: Varon et al. (2018) · '
-    'Effective wind speed calibration: Guanter et al. (2021)'
-    '</div>',
-    unsafe_allow_html=True,
-)
