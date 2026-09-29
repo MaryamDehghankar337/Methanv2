@@ -1,15 +1,12 @@
 """Sentinel-2 methane candidate screening app.
 
-MBMC-faithful v4 (calibrated + multi-band reference selection)
+MBMC-faithful v5 (small-plume mode)
+  • Composite reference from top-N scenes (median stacking)
+  • Local CFAR adaptive thresholding
+  • Reduced Gaussian smoothing to preserve sub-km plumes
   • Aradkouh landfill (Tehran) as default AOI
-  • Cloud cover 30% + last-30-days date defaults
-  • Robust reference selection using B11/B12 SWIR bands (methane-relevant)
-  • QA warning when residual sigma is physically implausible
   • 30-day time-series + visual daily playback
-  • Sentinel-5P CH4 with forced AOI-center display
-
-UI/design preserved. Algorithm engine follows MBMC paper with recalibrated
-smoothing, adaptive floor, and multi-band reference scoring.
+  • Sentinel-5P CH4 context
 """
 from __future__ import annotations
 
@@ -19,6 +16,7 @@ import math
 import re
 import hashlib
 import time
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -37,12 +35,11 @@ from scipy.ndimage import (
     binary_opening,
     gaussian_filter,
     label,
-    convolve,
+    uniform_filter,
 )
 from shapely.geometry import box, mapping, shape
 from shapely.ops import unary_union
 from skimage.morphology import disk
-from skimage.measure import regionprops
 from streamlit_folium import st_folium
 
 STAC_URL = "https://stac.dataspace.copernicus.eu/v1/"
@@ -57,23 +54,25 @@ RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 S5P_COLLECTION = "sentinel-5p-l2"
 
-# ── Default AOI: Aradkouh / Kahrizak landfill (Tehran) ───────────────
 DEFAULT_AOI = box(51.20, 35.40, 51.45, 35.60)
 
-# ── Landfill site (spatial constraint center) ────────────────────────
 SITE_LAT = 35.505
 SITE_LON = 51.330
 SITE_RADIUS_M = 5000.0
 
-# ── MBMC paper constants (recalibrated for small AOI + S2 noise) ─────
+# ── MBMC constants (v5: tuned for small-plume detection) ─────────────
 K_MBMP = 1.0e-5
-DETREND_SIGMA = 80.0        # ← کاهش از 150 (AOI کوچک ~1500 px)
-ABS_FLOOR_PPB = 5.0         # ← کاهش از 20 (σ واقعی انتظاری)
-N_SIGMA = 1.75              # ← کاهش از 2.5 (سیگنال ضعیف)
-GAUSS_SIGMA = 10.0          # ← افزایش از 3.0 (سرکوب نویز ۲۰ متری S2)
-FLOOD_MIN_SIZE = 10
-DILATE_RADIUS_FINAL = 3
-SIGMA_WARN_PPB = 50.0       # آستانهٔ هشدار QA — σ بالاتر = reference ناسالم
+DETREND_SIGMA = 80.0
+ABS_FLOOR_PPB = 5.0
+N_SIGMA = 1.75
+GAUSS_SIGMA = 6.0          # ← 6 px = 120 m; small plumes survive
+FLOOD_MIN_SIZE = 8         # ← 8 px = 3200 m² core
+DILATE_RADIUS_FINAL = 2    # ← کمتر برای حفظ لبه‌های پلوم
+SIGMA_WARN_PPB = 50.0
+
+# Local CFAR parameters
+LOCAL_WINDOW_PX = 51       # ~1 km at 20 m
+TOP_N_REFERENCES = 5       # how many refs to combine
 
 PARAMS = {
     "b03_quantile": 0.05,
@@ -93,9 +92,11 @@ PARAMS = {
     "abs_floor_ppb": ABS_FLOOR_PPB,
     "detrend_sigma": DETREND_SIGMA,
     "k_mbmp": K_MBMP,
-    "max_plume_area_km2": 100.0,   # ← افزایش از 10 (تهران بزرگ‌تر از 10 km²)
+    "max_plume_area_km2": 100.0,
     "site_radius_m": SITE_RADIUS_M,
     "sigma_warn_ppb": SIGMA_WARN_PPB,
+    "local_window_px": LOCAL_WINDOW_PX,
+    "top_n_references": TOP_N_REFERENCES,
 }
 
 
@@ -393,7 +394,6 @@ def normalized_difference(first, second):
 
 
 def _safe_corr(a, b):
-    """Safe Pearson correlation for possibly degenerate arrays."""
     if a.size < 2 or b.size < 2:
         return np.nan
     if np.std(a) < 1e-9 or np.std(b) < 1e-9:
@@ -406,12 +406,7 @@ def _safe_corr(a, b):
 
 
 def evaluate_reference(target_bands, reference_bands, min_pixels):
-    """Multi-band reference quality assessment.
-
-    Returns (combined_score, corr_b04, corr_b11, corr_b12, valid_count).
-    Combined score weights the methane-relevant SWIR bands (B11, B12)
-    more heavily than B04, since ΔR is computed in the SWIR.
-    """
+    """Multi-band reference scoring (SWIR-weighted)."""
     valid = (
         np.isfinite(target_bands["B04"]) & np.isfinite(reference_bands["B04"]) &
         np.isfinite(target_bands["B11"]) & np.isfinite(reference_bands["B11"]) &
@@ -421,19 +416,11 @@ def evaluate_reference(target_bands, reference_bands, min_pixels):
     if valid_count < min_pixels:
         return np.nan, np.nan, np.nan, np.nan, valid_count
 
-    t_b04 = target_bands["B04"][valid]
-    r_b04 = reference_bands["B04"][valid]
-    t_b11 = target_bands["B11"][valid]
-    r_b11 = reference_bands["B11"][valid]
-    t_b12 = target_bands["B12"][valid]
-    r_b12 = reference_bands["B12"][valid]
+    corr_b04 = _safe_corr(target_bands["B04"][valid], reference_bands["B04"][valid])
+    corr_b11 = _safe_corr(target_bands["B11"][valid], reference_bands["B11"][valid])
+    corr_b12 = _safe_corr(target_bands["B12"][valid], reference_bands["B12"][valid])
 
-    corr_b04 = _safe_corr(t_b04, r_b04)
-    corr_b11 = _safe_corr(t_b11, r_b11)
-    corr_b12 = _safe_corr(t_b12, r_b12)
-
-    weights = []
-    values = []
+    weights, values = [], []
     if np.isfinite(corr_b11):
         weights.append(0.45); values.append(corr_b11)
     if np.isfinite(corr_b12):
@@ -452,7 +439,7 @@ def evaluate_reference(target_bands, reference_bands, min_pixels):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  CORE ALGORITHM (MBMC-faithful + robust thresholding)
+#  CORE ALGORITHM
 # ══════════════════════════════════════════════════════════════════════
 
 def calculate_lrad(bands, q_value):
@@ -470,7 +457,6 @@ def calculate_lrad(bands, q_value):
 
 
 def calculate_c(b11, b12, valid):
-    """c = Σ(B11·B12) / Σ(B12²)."""
     use = valid & np.isfinite(b11) & np.isfinite(b12) & (b11 > 0.05) & (b12 > 0.05)
     if use.sum() < 100:
         return 1.0
@@ -483,7 +469,6 @@ def calculate_c(b11, b12, valid):
 
 
 def calculate_delta_R(b11, b12, c, valid):
-    """ΔR = (c·B12 − B11) / B12."""
     output = np.full(b11.shape, np.nan, dtype=np.float32)
     use = (
         valid
@@ -493,6 +478,29 @@ def calculate_delta_R(b11, b12, c, valid):
     )
     output[use] = (c * b12[use] - b11[use]) / b12[use]
     return output
+
+
+def build_composite_delta_R(references_bands, c, valid):
+    """Median-combine ΔR from multiple references.
+
+    Random temporal noise (aerosol, water vapour, slight BRDF drift)
+    averages out; the surface signal is repeatable and survives.
+    Does NOT use any spatial smoothing → small plumes preserved.
+    """
+    stack_list = []
+    for ref_bands in references_bands:
+        dR = calculate_delta_R(ref_bands["B11"], ref_bands["B12"], c, valid)
+        if np.isfinite(dR).any():
+            stack_list.append(dR)
+    if not stack_list:
+        return None
+    if len(stack_list) == 1:
+        return stack_list[0]
+    stack = np.stack(stack_list, axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        composite = np.nanmedian(stack, axis=0).astype(np.float32)
+    return composite
 
 
 def remove_large_scale_background(dOmega, valid_mask, sigma=DETREND_SIGMA):
@@ -519,6 +527,40 @@ def normalized_gaussian(data, valid_mask, sigma):
         output = ds / ws
     output[ws < 0.1] = np.nan
     return output.astype(np.float32)
+
+
+def local_cfar_threshold(data, valid_mask, window=LOCAL_WINDOW_PX,
+                          n_sigma=N_SIGMA, abs_floor=ABS_FLOOR_PPB):
+    """Local adaptive threshold (CFAR-style).
+
+    For every pixel, computes the mean and σ of the detrended field
+    in a sliding window (~window px = ~1 km at 20 m). Threshold is then
+    the local mean + max(n_sigma · local σ, abs_floor).
+
+    Benefits:
+      • Small plumes in a clean area → low local σ → low threshold → detected.
+      • Noisy regions → high local σ → high threshold → noise suppressed.
+      • No spatial blur applied to the data → small plumes preserved.
+    """
+    finite = valid_mask & np.isfinite(data)
+    d = np.where(finite, data, 0.0).astype(np.float32)
+    w = finite.astype(np.float32)
+
+    window = int(window)
+    if window % 2 == 0:
+        window += 1
+
+    wsum = uniform_filter(w, size=window, mode="constant")
+    wsum = np.maximum(wsum, 1e-6)
+
+    local_mean = uniform_filter(d, size=window, mode="constant") / wsum
+    d2 = np.where(finite, (data - local_mean) ** 2, 0.0).astype(np.float32)
+    local_var = uniform_filter(d2, size=window, mode="constant") / wsum
+    local_var = np.maximum(local_var, 1e-12)
+    local_sigma = np.sqrt(local_var)
+
+    threshold_map = local_mean + np.maximum(n_sigma * local_sigma, abs_floor)
+    return threshold_map.astype(np.float32), local_sigma.astype(np.float32)
 
 
 def make_spatial_mask(shape, profile, lat=SITE_LAT, lon=SITE_LON, radius_m=SITE_RADIUS_M):
@@ -552,7 +594,13 @@ def _robust_stats(values):
     return median, sigma_robust
 
 
-def run_algorithm(target, reference, profile):
+def run_algorithm(target, reference, profile, reference_list=None):
+    """MBMC with composite reference and local CFAR threshold.
+
+    `reference_list` is an optional list of band dicts. When provided with
+    ≥2 entries, ΔR_r is computed per reference and median-combined, which
+    reduces temporal noise without blurring the plume.
+    """
     target_q = float(np.nanquantile(target["B03"], PARAMS["b03_quantile"]))
     valid = calculate_lrad(target, target_q)
     if valid.sum() < 100:
@@ -560,7 +608,18 @@ def run_algorithm(target, reference, profile):
 
     c = calculate_c(target["B11"], target["B12"], valid)
     dR_t = calculate_delta_R(target["B11"], target["B12"], c, valid)
-    dR_r = calculate_delta_R(reference["B11"], reference["B12"], c, valid)
+
+    # ── Composite reference ΔR ────────────────────────────────────────
+    if reference_list and len(reference_list) >= 2:
+        dR_r = build_composite_delta_R(reference_list, c, valid)
+        n_refs_used = len(reference_list)
+    else:
+        ref = reference_list[0] if reference_list else reference
+        dR_r = calculate_delta_R(ref["B11"], ref["B12"], c, valid)
+        n_refs_used = 1
+
+    if dR_r is None:
+        raise RuntimeError("Could not compute ΔR from any reference.")
 
     dOmega_t = dR_t / K_MBMP
     dOmega_r = dR_r / K_MBMP
@@ -574,13 +633,16 @@ def run_algorithm(target, reference, profile):
     if vals.size == 0:
         raise RuntimeError("No finite values after detrending. Try a different reference scene.")
 
-    median, sigma_robust = _robust_stats(vals)
-    threshold = median + max(
-        PARAMS["threshold_sigma"] * sigma_robust,
-        PARAMS["abs_floor_ppb"],
-    )
+    global_median, global_sigma = _robust_stats(vals)
 
-    candidate = np.isfinite(d_smooth) & (d_smooth > threshold) & valid
+    # ── Local CFAR threshold ─────────────────────────────────────────
+    threshold_map, local_sigma_map = local_cfar_threshold(
+        d_smooth, valid,
+        window=PARAMS["local_window_px"],
+        n_sigma=PARAMS["threshold_sigma"],
+        abs_floor=PARAMS["abs_floor_ppb"],
+    )
+    candidate = np.isfinite(d_smooth) & (d_smooth > threshold_map) & valid
 
     spatial_mask, site_rc = make_spatial_mask(dOmega.shape, profile)
     candidate &= spatial_mask
@@ -593,22 +655,27 @@ def run_algorithm(target, reference, profile):
         sizes[0] = 0
         sizes_kept = np.where(sizes >= PARAMS["min_component_pixels"], sizes, 0)
         if sizes_kept.max() > 0:
-            order = np.argsort(sizes_kept)[::-1]
-            order = order[order != 0]
-            best_label = int(order[0])
-            best_size = int(sizes_kept[best_label])
-            if best_size < 30 and len(order) >= 2:
-                top_labels = order[:3]
-                plume = np.isin(labeled, top_labels)
-            else:
-                plume = (labeled == best_label)
+            # Keep ALL components above the size threshold (small-plume mode)
+            kept_labels = np.where(sizes_kept > 0)[0]
+            plume = np.isin(labeled, kept_labels)
+            # Safety cap on total area
             area_km2 = plume.sum() * (RESOLUTION * RESOLUTION) / 1e6
             if area_km2 > PARAMS["max_plume_area_km2"]:
-                plume[:] = False
+                # If total area is absurdly large, fall back to top-3 largest
+                order = np.argsort(sizes_kept)[::-1]
+                order = order[order != 0][:3]
+                plume = np.isin(labeled, order)
+                area_km2 = plume.sum() * (RESOLUTION * RESOLUTION) / 1e6
+                if area_km2 > PARAMS["max_plume_area_km2"]:
+                    plume[:] = False
 
     if plume.any() and PARAMS["final_dilation"] > 0:
         plume = binary_dilation(plume, structure=disk(int(PARAMS["final_dilation"])))
     plume &= valid & spatial_mask
+
+    # Local sigma summary (median over valid pixels)
+    local_sigma_valid = local_sigma_map[np.isfinite(local_sigma_map) & valid]
+    local_sigma_median = float(np.median(local_sigma_valid)) if local_sigma_valid.size else float("nan")
 
     return {
         "relative": dOmega,
@@ -618,22 +685,28 @@ def run_algorithm(target, reference, profile):
         "spatial_mask": spatial_mask,
         "initial": candidate,
         "final": plume,
-        "mean": median,
-        "std": sigma_robust,
-        "threshold": threshold,
-        "regions": int(1 if plume.any() else 0),
+        "threshold_map": threshold_map,
+        "mean": global_median,
+        "std": global_sigma,
+        "local_sigma_median": local_sigma_median,
+        "threshold": float(np.nanmedian(threshold_map[valid])) if valid.any() else 0.0,
+        "regions": int(len(np.unique(labeled[plume])) - (1 if 0 in np.unique(labeled[plume]) else 0)) if plume.any() else 0,
         "valid_count": int(valid.sum()),
         "initial_count": int(candidate.sum()),
         "final_count": int(plume.sum()),
         "c": float(c),
         "site_rc": site_rc,
+        "n_refs_used": int(n_refs_used),
     }
 
 
 def save_raster(path, array, profile, mask=False):
     output_profile = profile.copy()
-    output_profile.update(count=1, dtype="uint8" if mask else "float32", nodata=255 if mask else -9999, compress="deflate", tiled=False, BIGTIFF="IF_SAFER")
-    output = np.where(array, 1, 0).astype(np.uint8) if mask else np.where(np.isfinite(array), array, -9999).astype(np.float32)
+    output_profile.update(count=1, dtype="uint8" if mask else "float32",
+                          nodata=255 if mask else -9999,
+                          compress="deflate", tiled=False, BIGTIFF="IF_SAFER")
+    output = np.where(array, 1, 0).astype(np.uint8) if mask else \
+             np.where(np.isfinite(array), array, -9999).astype(np.float32)
     with rasterio.open(path, "w", **output_profile) as destination:
         destination.write(output, 1)
 
@@ -734,7 +807,8 @@ def georeferenced_png_package(array, profile, mask=False):
 #  TIME-SERIES
 # ══════════════════════════════════════════════════════════════════════
 
-def process_single_day(target_scene, reference_scenes, aoi, access_token, store_image=True):
+def process_single_day(target_scene, reference_scenes, aoi, access_token,
+                        store_image=True, top_n=None):
     try:
         target_date = get_datetime(target_scene)
         target_path = download_scene(target_scene, aoi, access_token)
@@ -743,11 +817,8 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
         same_tile = [r for r in reference_scenes if get_tile(r) == target_tile]
         candidates = same_tile if same_tile else reference_scenes
 
-        best_ref_bands = None
-        best_score = -np.inf
-        best_b4 = np.nan
-        best_valid = 0
-
+        top_n = top_n or PARAMS["top_n_references"]
+        scored = []
         for ref in candidates:
             try:
                 ref_bands, _ = read_stack(download_scene(ref, aoi, access_token))
@@ -756,31 +827,35 @@ def process_single_day(target_scene, reference_scenes, aoi, access_token, store_
             combined, corr_b04, _, _, valid_count = evaluate_reference(
                 target_bands, ref_bands, PARAMS["min_valid_ref_pixels"]
             )
-            if np.isfinite(combined) and combined > best_score:
-                best_score = combined
-                best_ref_bands = ref_bands
-                best_b4 = corr_b04
-                best_valid = valid_count
-            elif best_ref_bands is None and valid_count > best_valid:
-                best_ref_bands = ref_bands
-                best_valid = valid_count
-                best_score = np.nan
-                best_b4 = corr_b04
+            scored.append((combined, ref_bands, corr_b04, valid_count))
 
-        if best_ref_bands is None:
+        scored_ok = [s for s in scored if np.isfinite(s[0])]
+        scored_ok.sort(key=lambda x: x[0], reverse=True)
+        top = scored_ok[:top_n]
+
+        if not top:
+            # fallback to any valid reference
+            top = [s for s in scored if s[3] > PARAMS["min_valid_ref_pixels"]][:1]
+        if not top:
             return None
 
-        result = run_algorithm(target_bands, best_ref_bands, target_profile)
+        ref_list = [s[1] for s in top]
+        best_score = top[0][0] if np.isfinite(top[0][0]) else np.nan
+        best_b4 = top[0][2]
+
+        result = run_algorithm(target_bands, ref_list[0], target_profile, reference_list=ref_list)
 
         row = {
             "date": target_date,
             "mean_mbmp": float(np.nanmean(result["detrended"])),
             "max_mbmp": float(np.nanmax(result["detrended"])),
             "std_mbmp": float(np.nanstd(result["detrended"])),
+            "local_sigma_median": float(result.get("local_sigma_median", np.nan)),
             "final_pixels": int(result["final_count"]),
             "regions": int(result["regions"]),
             "ref_score": float(best_score) if np.isfinite(best_score) else np.nan,
             "b4_correlation": float(best_b4) if np.isfinite(best_b4) else np.nan,
+            "n_refs_used": int(result.get("n_refs_used", 1)),
         }
         if store_image:
             row["png_relative"] = image_png(result["detrended"])
@@ -865,9 +940,9 @@ st.markdown("""
 <div class="app-header">
     <div>
         <div class="app-title">🛰️ Sentinel-2 Methane Screening</div>
-        <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC-faithful ΔΩ (ppb) candidate detection</div>
+        <div class="app-subtitle">CDSE STAC + Process API &nbsp;|&nbsp; MBMC ΔΩ (ppb) · Composite reference · Local CFAR threshold</div>
     </div>
-    <div class="status-pill">20 m processing &nbsp;•&nbsp; Multi-band reference scoring</div>
+    <div class="status-pill">20 m &nbsp;•&nbsp; Small-plume mode</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -913,15 +988,12 @@ with control_col:
                     datetime.combine(end_date, datetime.max.time()),
                     max_cloud,
                 )
-
             if search_results is None:
                 search_results = []
             elif not isinstance(search_results, list):
                 search_results = list(search_results)
-
             st.session_state["scene_results"] = search_results
             st.session_state.pop("target", None)
-
             if search_results:
                 st.success(f"{len(search_results)} scene(s) found")
             else:
@@ -935,44 +1007,22 @@ with control_col:
 
     if scene_results:
         scene_table = pd.DataFrame([
-            {
-                "date": get_datetime(scene),
-                "tile": get_tile(scene),
-                "cloud": get_cloud(scene),
-            }
+            {"date": get_datetime(scene), "tile": get_tile(scene), "cloud": get_cloud(scene)}
             for scene in scene_results
-        ]).sort_values(
-            ["date", "cloud"],
-            ascending=[True, True],
-            na_position="last",
-        )
+        ]).sort_values(["date", "cloud"], ascending=[True, True], na_position="last")
 
         st.dataframe(
-            scene_table,
-            use_container_width=True,
-            height=112,
-            hide_index=True,
+            scene_table, use_container_width=True, height=112, hide_index=True,
             column_config={
                 "date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
                 "cloud": st.column_config.NumberColumn("Cloud %", format="%.1f"),
             },
         )
 
-        scene_ids = [
-            as_dict(scene).get("id")
-            for scene in scene_results
-            if as_dict(scene).get("id")
-        ]
+        scene_ids = [as_dict(scene).get("id") for scene in scene_results if as_dict(scene).get("id")]
 
         def format_scene(scene_id):
-            scene = next(
-                (
-                    candidate
-                    for candidate in scene_results
-                    if as_dict(candidate).get("id") == scene_id
-                ),
-                None,
-            )
+            scene = next((c for c in scene_results if as_dict(c).get("id") == scene_id), None)
             if scene is None:
                 return str(scene_id)
             scene_date = get_datetime(scene)
@@ -980,20 +1030,8 @@ with control_col:
             return f"{date_text}  |  {get_tile(scene) or 'Unknown tile'}  |  cloud {get_cloud(scene):.1f}%"
 
         if scene_ids:
-            selected_scene_id = st.selectbox(
-                "Target scene",
-                scene_ids,
-                format_func=format_scene,
-                key="target_scene_select",
-            )
-            selected_scene = next(
-                (
-                    scene
-                    for scene in scene_results
-                    if as_dict(scene).get("id") == selected_scene_id
-                ),
-                None,
-            )
+            selected_scene_id = st.selectbox("Target scene", scene_ids, format_func=format_scene, key="target_scene_select")
+            selected_scene = next((s for s in scene_results if as_dict(s).get("id") == selected_scene_id), None)
             if selected_scene is not None:
                 st.session_state["target"] = selected_scene
 
@@ -1004,16 +1042,18 @@ settings_col, action_col = st.columns([1.65, 1.0], gap="small")
 with settings_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">03 · DETECTION</div>', unsafe_allow_html=True)
-    p1, p2, p3 = st.columns(3, gap="small")
+    p1, p2, p3, p4 = st.columns(4, gap="small")
     with p1:
-        PARAMS["threshold_sigma"] = st.number_input("Threshold multiplier", min_value=0.1, max_value=6.0, value=float(PARAMS["threshold_sigma"]), step=0.1, key="threshold_sigma")
+        PARAMS["threshold_sigma"] = st.number_input("Local σ multiplier", min_value=0.1, max_value=6.0, value=float(PARAMS["threshold_sigma"]), step=0.1, key="threshold_sigma")
     with p2:
-        PARAMS["min_component_pixels"] = st.number_input("Minimum candidate pixels", min_value=2, max_value=1000, value=int(PARAMS["min_component_pixels"]), step=5, key="min_component_pixels")
+        PARAMS["min_component_pixels"] = st.number_input("Min pixels / component", min_value=2, max_value=1000, value=int(PARAMS["min_component_pixels"]), step=1, key="min_component_pixels")
     with p3:
-        PARAMS["final_dilation"] = st.number_input("Final dilation radius", min_value=0, max_value=20, value=int(PARAMS["final_dilation"]), step=1, key="final_dilation")
+        PARAMS["final_dilation"] = st.number_input("Dilation radius", min_value=0, max_value=20, value=int(PARAMS["final_dilation"]), step=1, key="final_dilation")
+    with p4:
+        PARAMS["local_window_px"] = st.number_input("Local window (px)", min_value=11, max_value=201, value=int(PARAMS["local_window_px"]), step=2, key="local_window_px")
+    PARAMS["top_n_references"] = st.slider("References combined (composite)", 1, 10, int(PARAMS["top_n_references"]), key="top_n_references")
     estimated_area_m2 = int(PARAMS["min_component_pixels"]) * RESOLUTION * RESOLUTION
-    st.markdown(f'<div class="card-caption">Minimum connected region ≈ {estimated_area_m2:,} m² at {RESOLUTION} m resolution. '
-                f'Gaussian σ = {GAUSS_SIGMA:.0f} px · detrend σ = {DETREND_SIGMA:.0f} px · absolute floor = {ABS_FLOOR_PPB:.1f} ppb.</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="card-caption">Min region ≈ {estimated_area_m2:,} m² · gaussian σ = {GAUSS_SIGMA:.0f} px (~{GAUSS_SIGMA*RESOLUTION:.0f} m) · detrend σ = {DETREND_SIGMA:.0f} px · local window ≈ {PARAMS["local_window_px"]*RESOLUTION} m · floor = {ABS_FLOOR_PPB:.1f} ppb.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with action_col:
@@ -1081,22 +1121,18 @@ with action_col:
                     if not references:
                         st.warning("No reference scene exists in the selected time window. Increase the date range or reference window.")
                         st.stop()
-                    progress_status.markdown('<div class="card-caption">Step 2 of 5 · Downloading target image bands and preparing the AOI…</div>', unsafe_allow_html=True)
+                    progress_status.markdown('<div class="card-caption">Step 2 of 5 · Downloading target image bands…</div>', unsafe_allow_html=True)
                     progress.progress(25, text="Downloading target bands…")
                     target_bands, profile = read_stack(download_scene(target, st.session_state.aoi, access_token))
 
-                    best_reference = None
-                    best_score = -np.inf
-                    best_b4 = np.nan
-                    best_valid = 0
                     reference_rows = []
+                    reference_bands_list = []  # (score, bands, corr_b04, valid_count)
                     total_refs = max(1, len(references))
 
                     for ref_index, reference in enumerate(references, start=1):
                         pct = 30 + int(40 * (ref_index - 1) / total_refs)
-                        progress_status.markdown(f'<div class="card-caption">Step 3 of 5 · Evaluating reference scene {ref_index} of {total_refs} (multi-band SWIR scoring)…</div>', unsafe_allow_html=True)
-                        progress.progress(pct, text=f"Reference scene {ref_index} of {total_refs}…")
-
+                        progress_status.markdown(f'<div class="card-caption">Step 3 of 5 · Evaluating reference {ref_index} of {total_refs}…</div>', unsafe_allow_html=True)
+                        progress.progress(pct, text=f"Reference {ref_index} of {total_refs}…")
                         try:
                             reference_bands, _ = read_stack(download_scene(reference, st.session_state.aoi, access_token))
                         except Exception:
@@ -1112,11 +1148,9 @@ with action_col:
                                 "status": "download failed",
                             })
                             continue
-
                         combined, corr_b04, corr_b11, corr_b12, valid_count = evaluate_reference(
                             target_bands, reference_bands, PARAMS["min_valid_ref_pixels"]
                         )
-
                         reference_rows.append({
                             "id": as_dict(reference).get("id"),
                             "date": get_datetime(reference),
@@ -1128,39 +1162,30 @@ with action_col:
                             "valid_pixels": valid_count,
                             "status": "ok" if np.isfinite(combined) else "low-validity",
                         })
-
-                        if np.isfinite(combined) and combined > best_score:
-                            best_score = combined
-                            best_reference = reference_bands
-                            best_b4 = corr_b04
-                            best_valid = valid_count
-                        elif best_reference is None and valid_count > best_valid:
-                            best_valid = valid_count
-                            best_reference = reference_bands
-                            best_score = np.nan
-                            best_b4 = corr_b04
+                        if np.isfinite(combined):
+                            reference_bands_list.append((combined, reference_bands, corr_b04, valid_count))
 
                     st.session_state.reference_table = pd.DataFrame(reference_rows)
 
-                    if best_reference is None:
-                        total_valid = sum(int(r.get("valid_pixels", 0)) for r in reference_rows)
-                        target_valid = int(np.isfinite(target_bands["B04"]).sum())
-                        st.error(
-                            f"Could not select a reference scene.\n\n"
-                            f"- References downloaded: **{len(reference_rows)}**\n"
-                            f"- Total valid pixels across all references: **{total_valid:,}**\n"
-                            f"- Target valid B4 pixels: **{target_valid:,}**\n\n"
-                            f"**Suggestions:**\n"
-                            f"1. Increase the **date range** (make start date earlier).\n"
-                            f"2. Increase the **cloud cover** threshold to 50–70%.\n"
-                            f"3. Increase **Reference window (days)** to 30–60.\n"
-                            f"4. Enlarge the AOI on the map (at least ~30×30 km)."
-                        )
+                    if not reference_bands_list:
+                        st.error("No reference scene passed the multi-band quality test. Increase date range or cloud cover threshold.")
                         st.stop()
 
-                    progress_status.markdown('<div class="card-caption">Step 4 of 5 · Running MBMC ΔΩ (ppb) anomaly detection and candidate cleanup…</div>', unsafe_allow_html=True)
+                    # Sort by composite score, take top-N
+                    reference_bands_list.sort(key=lambda x: x[0], reverse=True)
+                    top_n = max(1, int(PARAMS["top_n_references"]))
+                    selected_refs = reference_bands_list[:top_n]
+                    ref_list_bands = [s[1] for s in selected_refs]
+                    best_score = selected_refs[0][0]
+                    best_b4 = selected_refs[0][2]
+
+                    progress_status.markdown(
+                        f'<div class="card-caption">Step 4 of 5 · Running MBMC with composite reference ({len(ref_list_bands)} scenes) + local CFAR threshold…</div>',
+                        unsafe_allow_html=True,
+                    )
                     progress.progress(78, text="Running methane detection…")
-                    result = run_algorithm(target_bands, best_reference, profile)
+
+                    result = run_algorithm(target_bands, ref_list_bands[0], profile, reference_list=ref_list_bands)
                     result["b4_correlation"] = float(best_b4) if np.isfinite(best_b4) else float("nan")
                     result["combined_score"] = float(best_score) if np.isfinite(best_score) else float("nan")
                     result["date"] = target_date.strftime("%Y-%m-%d")
@@ -1174,6 +1199,8 @@ with action_col:
                     for key in ("relative", "detrended", "gaussian", "final", "valid"):
                         paths[key] = output_folder / f"{key}.tif"
                         save_raster(paths[key], result[key], profile, key in ("final", "valid"))
+                    save_raster(output_folder / "threshold_map.tif", result["threshold_map"], profile, mask=False)
+
                     st.session_state.result = result
                     st.session_state.paths = paths
                     st.session_state.output_profile = profile
@@ -1184,37 +1211,29 @@ with action_col:
                         "final": image_png(result["final"], mask=True),
                         "valid": image_png(result["valid"], mask=True),
                     }
-                    progress_status.markdown('<div class="card-caption">Step 5 of 5 · Saving georeferenced outputs and preparing downloads…</div>', unsafe_allow_html=True)
-                    progress.progress(100, text="Ready to detect · outputs are ready")
-                    st.success("Processing completed")
+                    progress_status.markdown('<div class="card-caption">Step 5 of 5 · Saving georeferenced outputs…</div>', unsafe_allow_html=True)
+                    progress.progress(100, text="Ready · outputs are ready")
+                    st.success(f"Processing completed · composite reference = {len(ref_list_bands)} scene(s)")
 
-                    # ── QA warnings ────────────────────────────────────
+                    # QA warnings
                     if result["std"] > SIGMA_WARN_PPB:
                         st.warning(
-                            f"⚠️ **Residual noise is physically implausible** "
-                            f"(robust σ = **{result['std']:.1f} ppb**, threshold above "
-                            f"~{SIGMA_WARN_PPB:.0f} ppb suggests the reference scene is unreliable). "
-                            f"Real methane fluctuations between two S2 acquisitions rarely exceed "
-                            f"10–30 ppb after detrending. The candidate mask in this run is likely "
-                            f"dominated by residual surface/aerosol noise rather than real CH4. "
-                            f"**Try:** (1) a reference date within 5–10 days, (2) a larger AOI, "
-                            f"(3) higher Gaussian σ (e.g. 15–20 px)."
+                            f"⚠️ Global σ (robust) = **{result['std']:.1f} ppb** is above the physical range "
+                            f"(> {SIGMA_WARN_PPB:.0f} ppb). Local CFAR threshold still works, but "
+                            f"the reference set may not be optimal. Try more references, shorter window, "
+                            f"or a larger AOI."
                         )
-
                     if result["final_count"] == 0:
                         st.warning(
-                            f"⚠️ **No plume above threshold detected.** "
-                            f"Median ΔΩ = {result['mean']:.2f} ppb, robust σ = {result['std']:.2f} ppb, "
-                            f"threshold = {result['threshold']:.2f} ppb. "
-                            f"Try lowering the Threshold multiplier to 1.2–1.5, or pick a different "
-                            f"target/reference date pair."
+                            f"⚠️ No candidate above local threshold. "
+                            f"Local median threshold ≈ {result['threshold']:.2f} ppb, "
+                            f"global σ = {result['std']:.2f} ppb. "
+                            f"Try lowering the local σ multiplier (1.2–1.5) or increasing composite references."
                         )
-                    elif signal_ratio < 0.00005:
+                    elif signal_ratio < 0.00002:
                         st.warning(
-                            f"⚠️ **Very small final mask.** "
-                            f"The candidate mask covers only **{signal_ratio*100:.5f}%** of valid pixels "
-                            f"({result['final_count']:,} / {result['valid_count']:,}). "
-                            f"This may be a weak plume or residual noise."
+                            f"⚠️ Very small final mask ({signal_ratio*100:.5f}% of valid pixels). "
+                            f"May be a weak plume or residual noise."
                         )
                 except Exception as error:
                     st.error(f"Detection failed: {error}")
@@ -1233,22 +1252,17 @@ if "result" in st.session_state:
     st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
-    metrics = st.columns(6, gap="small")
 
+    metrics = st.columns(7, gap="small")
     combined_display = result.get("combined_score", np.nan)
-    if np.isfinite(combined_display):
-        score_text = f"{combined_display:.3f}"
-    elif np.isfinite(result.get("b4_correlation", np.nan)):
-        score_text = f"{result['b4_correlation']:.3f} (B4)"
-    else:
-        score_text = "n/a"
-
-    metrics[0].metric("Ref score (SWIR-weighted)", score_text)
-    metrics[1].metric("Valid pixels", f"{result['valid_count']:,}")
-    metrics[2].metric("Initial", f"{result['initial_count']:,}")
-    metrics[3].metric("Final", f"{result['final_count']:,}")
-    metrics[4].metric("Regions", result["regions"])
-    metrics[5].metric("Threshold", f"{result['threshold']:.2f}")
+    score_text = f"{combined_display:.3f}" if np.isfinite(combined_display) else "n/a"
+    metrics[0].metric("Ref score", score_text)
+    metrics[1].metric("Refs used", result.get("n_refs_used", 1))
+    metrics[2].metric("Global σ (ppb)", f"{result['std']:.1f}")
+    metrics[3].metric("Local σ med (ppb)", f"{result.get('local_sigma_median', np.nan):.1f}")
+    metrics[4].metric("Initial", f"{result['initial_count']:,}")
+    metrics[5].metric("Final", f"{result['final_count']:,}")
+    metrics[6].metric("Regions", result["regions"])
 
     result_items = [
         ("detrended", "ΔΩ after detrend (ppb)", "Detrended"),
@@ -1267,12 +1281,7 @@ if "result" in st.session_state:
                 st.image(png_outputs[key], use_container_width=True, output_format="PNG")
             with legend_col:
                 st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
-                if key == "final":
-                    legend_kind = "mask"
-                elif key == "valid":
-                    legend_kind = "valid"
-                else:
-                    legend_kind = "continuous"
+                legend_kind = "mask" if key == "final" else ("valid" if key == "valid" else "continuous")
                 st.markdown(legend_html(legend_kind), unsafe_allow_html=True)
             path = st.session_state.paths[key]
             format_choice = st.selectbox("Download format", ["GeoTIFF (georeferenced)", "PNG + World File (georeferenced)"], key=f"format_choice_{key}")
@@ -1280,24 +1289,33 @@ if "result" in st.session_state:
                 st.download_button("⬇ Download GeoTIFF", path.read_bytes(), file_name=path.name, mime="image/tiff", key=f"download_tif_compact_{key}", use_container_width=True)
             else:
                 png_package = georeferenced_png_package(result[key], profile, mask=key in ("final", "valid"))
-                st.download_button("⬇ Download Georeferenced PNG package", png_package, file_name=f"{key}_georeferenced_png.zip", mime="application/zip", key=f"download_png_compact_{key}", use_container_width=True)
+                st.download_button("⬇ Download PNG package", png_package, file_name=f"{key}_georeferenced_png.zip", mime="application/zip", key=f"download_png_compact_{key}", use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-    removed_pixels = max(0, int(result["initial_count"]) - int(result["final_count"]))
-    st.markdown(f'<div class="result-note"><b>Robust thresholding:</b> median = <b>{result["mean"]:.2f} ppb</b>, robust σ = <b>{result["std"]:.2f} ppb</b>, threshold = <b>{result["threshold"]:.2f} ppb</b>. Only the largest connected region ≥ <b>{int(PARAMS["min_component_pixels"]):,} px</b> was kept (MBMC convention). Initial: <b>{result["initial_count"]:,}</b> → Final: <b>{result["final_count"]:,}</b> · c = <b>{result["c"]:.4f}</b> · detrend σ = <b>{DETREND_SIGMA:.0f} px</b> · gaussian σ = <b>{GAUSS_SIGMA:.0f} px</b> · floor = <b>{ABS_FLOOR_PPB:.0f} ppb</b>.</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="result-note"><b>v5 composite + local CFAR:</b> '
+        f'global median = <b>{result["mean"]:.2f} ppb</b>, global σ = <b>{result["std"]:.2f} ppb</b>, '
+        f'local σ median = <b>{result.get("local_sigma_median", np.nan):.2f} ppb</b>, '
+        f'local threshold median = <b>{result["threshold"]:.2f} ppb</b>. '
+        f'<b>{result.get("n_refs_used", 1)} reference scene(s)</b> combined by median. '
+        f'Gaussian σ = <b>{GAUSS_SIGMA:.0f} px (~{GAUSS_SIGMA*RESOLUTION:.0f} m)</b>, '
+        f'detrend σ = <b>{DETREND_SIGMA:.0f} px</b>, local window = <b>{PARAMS["local_window_px"]} px (~{PARAMS["local_window_px"]*RESOLUTION} m)</b>, '
+        f'c = <b>{result["c"]:.4f}</b>.</div>',
+        unsafe_allow_html=True,
+    )
     d1, d2 = st.columns([1, 3], gap="small")
     with d1:
         st.download_button("⬇ Reference table CSV", st.session_state.reference_table.to_csv(index=False), file_name="reference_selection.csv", mime="text/csv", key="download_reference_csv_compact", use_container_width=True)
     with d2:
-        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">ΔΩ (ppb) is a screening quantity following the MBMC framework (Cheng et al., 2026); it is not physical methane concentration or an emission rate. Reference scoring now weights the SWIR bands (B11/B12) that carry the methane signal.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card-caption" style="margin-top:0.55rem;">ΔΩ (ppb) is a screening quantity (MBMC framework, Cheng et al., 2026). Not a physical CH4 concentration or emission rate.</div>', unsafe_allow_html=True)
 
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05a · 30-DAY TIME SERIES & VISUAL PLAYBACK</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">Track daily changes of detrended ΔΩ (ppb) over the 30-day window. Use the slider below the chart to visually scrub through each day.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">Track daily changes of detrended ΔΩ (ppb) over the 30-day window.</div>', unsafe_allow_html=True)
 
     ts_col1, ts_col2 = st.columns([1, 3], gap="small")
     with ts_col1:
-        run_ts = st.button("📈  Build 30-day series + visuals", type="primary", use_container_width=True, key="build_ts_button", disabled=not bool(st.session_state.get("cdse_auth")))
+        run_ts = st.button("📈  Build 30-day series", type="primary", use_container_width=True, key="build_ts_button", disabled=not bool(st.session_state.get("cdse_auth")))
     with ts_col2:
         st.markdown('<div class="card-caption" style="margin-top:0.55rem;">Downloads and processes every Sentinel-2 scene in the window. Cached after first run.</div>', unsafe_allow_html=True)
 
@@ -1320,8 +1338,7 @@ if "result" in st.session_state:
 
             ts_progress = st.progress(0, text="Building time series…")
             ts_status = st.empty()
-            rows = []
-            daily_visuals = {}
+            rows, daily_visuals = [], {}
             total_days = max(1, len(days_sorted))
             for idx, day in enumerate(days_sorted, start=1):
                 ts_status.markdown(f'<div class="card-caption">Processing day {idx} of {total_days} · {day.isoformat()}</div>', unsafe_allow_html=True)
@@ -1346,16 +1363,15 @@ if "result" in st.session_state:
                         "max_mbmp": row["max_mbmp"],
                         "final_pixels": row["final_pixels"],
                     }
-
             if rows:
                 ts_df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
                 st.session_state.timeseries_df = ts_df
                 st.session_state.daily_visuals = daily_visuals
                 ts_progress.progress(100, text="Time series ready")
                 ts_status.empty()
-                st.success(f"Time series built · {len(ts_df)} day(s) processed · {len(daily_visuals)} visual frames")
+                st.success(f"Time series built · {len(ts_df)} day(s) · {len(daily_visuals)} visual frames")
             else:
-                st.warning("No valid day could be processed. Try a wider date range or a larger AOI.")
+                st.warning("No valid day could be processed.")
         except Exception as ts_error:
             st.error(f"Time series failed: {ts_error}")
 
@@ -1367,41 +1383,26 @@ if "result" in st.session_state:
                 st.markdown('<div class="card-caption">Daily detrended ΔΩ (ppb) statistics in the AOI</div>', unsafe_allow_html=True)
                 st.line_chart(chart_df, use_container_width=True, height=240)
                 st.dataframe(
-                    ts,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=180,
+                    ts, use_container_width=True, hide_index=True, height=180,
                     column_config={
                         "date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
                         "mean_mbmp": st.column_config.NumberColumn("Mean ΔΩ (ppb)", format="%.2f"),
                         "max_mbmp": st.column_config.NumberColumn("Max ΔΩ (ppb)", format="%.2f"),
                         "std_mbmp": st.column_config.NumberColumn("Std ΔΩ (ppb)", format="%.2f"),
+                        "local_sigma_median": st.column_config.NumberColumn("Local σ med", format="%.2f"),
                         "ref_score": st.column_config.NumberColumn("Ref score", format="%.3f"),
-                        "b4_correlation": st.column_config.NumberColumn("B4 corr", format="%.3f"),
+                        "n_refs_used": st.column_config.NumberColumn("Refs", format="%d"),
                     },
                 )
-                st.download_button(
-                    "⬇ Download 30-day series CSV",
-                    ts.to_csv(index=False),
-                    file_name="s2_timeseries_30d.csv",
-                    mime="text/csv",
-                    key="download_ts_csv",
-                    use_container_width=False,
-                )
+                st.download_button("⬇ Download 30-day series CSV", ts.to_csv(index=False), file_name="s2_timeseries_30d.csv", mime="text/csv", key="download_ts_csv", use_container_width=False)
 
     if "daily_visuals" in st.session_state:
         visuals = st.session_state.daily_visuals
         dates_available = sorted(visuals.keys())
         if dates_available:
             st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
-            st.markdown('<div class="card-caption" style="font-weight:700;font-size:0.85rem;">🎬 Visual daily playback — drag the slider to scrub through the month</div>', unsafe_allow_html=True)
-            selected_day = st.select_slider(
-                "Select day",
-                options=dates_available,
-                value=dates_available[0],
-                key="visual_day_slider",
-                label_visibility="collapsed",
-            )
+            st.markdown('<div class="card-caption" style="font-weight:700;font-size:0.85rem;">🎬 Visual daily playback</div>', unsafe_allow_html=True)
+            selected_day = st.select_slider("Select day", options=dates_available, value=dates_available[0], key="visual_day_slider", label_visibility="collapsed")
             if selected_day in visuals:
                 frame = visuals[selected_day]
                 v1, v2 = st.columns(2, gap="small")
@@ -1418,7 +1419,7 @@ if "result" in st.session_state:
 
     st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05b · SENTINEL-5P CH4 CONTEXT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). All pixels are shown (no QA filtering). Visualization is <b>anomaly relative to the local mean</b>.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-caption">TROPOMI CH4 (~5.5 × 7 km). Visualization is anomaly relative to the local mean.</div>', unsafe_allow_html=True)
 
     s5p_col1, s5p_col2 = st.columns([1, 3], gap="small")
     with s5p_col1:
@@ -1451,17 +1452,11 @@ if "result" in st.session_state:
     if "s5p_ch4" in st.session_state:
         ch4 = st.session_state.s5p_ch4
         valid_ch4 = ch4[np.isfinite(ch4)]
-
         if valid_ch4.size < 2:
             placeholder = float(np.nanmean(valid_ch4)) if valid_ch4.size > 0 else 1900.0
             ch4 = np.full_like(ch4, placeholder)
             valid_ch4 = ch4[np.isfinite(ch4)]
-            st.warning(
-                "⚠️ Sentinel-5P returned no valid pixels for this AOI and time window "
-                "(cloud cover / QA). Showing the AOI center with a placeholder value. "
-                "Try increasing the temporal window to 30 days."
-            )
-
+            st.warning("⚠️ S5P returned no valid pixels — placeholder shown. Try a 30-day window.")
         if valid_ch4.size > 1:
             mean_val = float(np.nanmean(valid_ch4))
             max_val = float(np.nanmax(valid_ch4))
@@ -1479,6 +1474,6 @@ if "result" in st.session_state:
                 st.markdown(legend_html("s5p"), unsafe_allow_html=True)
             st.markdown('<div class="card-caption">Each pixel is shown as deviation from the local mean (red = above, blue = below). At TROPOMI\'s ~7 km resolution, a small landfill may only occupy 1–2 pixels.</div>', unsafe_allow_html=True)
         else:
-            st.warning("Not enough valid S5P CH4 pixels even after fallback. Increase the temporal window to 30 days.")
+            st.warning("Not enough valid S5P CH4 pixels even after fallback.")
 
     st.markdown('</div>', unsafe_allow_html=True)
